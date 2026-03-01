@@ -10,13 +10,13 @@ You are the **Shield** in a 3-stage quality pipeline. You verify. You do NOT wri
 
 A system with:
 - REST API for reservation intake (FastAPI + Pydantic)
-- Outbound calling via Twilio Programmable Voice (webhooks, TwiML)
-- Real-time speech-to-text (streaming transcription)
-- LLM-driven conversation engine (OpenAI GPT-4o with function calling)
-- Text-to-speech for agent responses
+- Outbound calling via Twilio Programmable Voice (WebSocket Media Streams, bidirectional audio)
+- Provider-abstracted STT (default: OpenAI Whisper) via `STTProvider` interface
+- Provider-abstracted LLM (default: OpenAI GPT-4o with function calling) via `LLMProvider` interface
+- Provider-abstracted TTS (default: OpenAI TTS) via `TTSProvider` interface
 - State machine for reservation lifecycle (pending → calling → confirmed / failed)
-- Celery task queue for async call orchestration with retry logic
-- SQLite for reservation tracking and transcript storage
+- Celery task queue + Redis (session store via `SessionStore` interface, broker, distributed locks)
+- SQLite (reservation tracking, transcripts via `Database` interface)
 - Notification service (SMS/email) for user updates
 
 ### Domain-Specific Failure Modes to Always Check
@@ -24,19 +24,19 @@ A system with:
 **Telephony failures:**
 - Twilio `calls.create()` throws exception (invalid number, insufficient funds, rate limited)
 - Call status transitions unexpectedly (e.g., `ringing` → `failed` without `in-progress`)
-- Webhook handler receives duplicate callbacks — must be idempotent
-- Webhook arrives for unknown Call SID (race condition on call creation)
-- Call drops mid-conversation — partial state must be handled
+- Status callback receives duplicate callbacks — must be idempotent
+- WebSocket Media Stream disconnects mid-conversation — partial state must be handled
 - Busy signal or no-answer — retry logic must trigger correctly
 - Voicemail detected — agent must recognize and hang up gracefully
 
-**Speech & NLU failures:**
-- STT returns empty or garbage transcript (background noise, poor connection)
+**Provider & speech failures:**
+- STT provider returns empty or garbage transcript (background noise, poor connection)
 - STT misrecognizes times (e.g., "7:30" heard as "7:13" or "730")
 - STT misrecognizes names or numbers — high error category
-- TTS response exceeds acceptable latency (>3 seconds perceived as broken)
+- TTS provider exceeds acceptable latency (>3 seconds perceived as broken)
 - LLM response is incoherent, hallucinates details, or agrees outside user bounds
 - LLM timeout — fallback scripted response must be served
+- **Provider interface violation** — implementation doesn't match abstract interface contract
 
 **Conversation & negotiation failures:**
 - Agent agrees to a time outside the user's specified flexibility window
@@ -48,7 +48,7 @@ A system with:
 
 **State machine failures:**
 - Invalid state transition (e.g., `confirmed` → `calling`)
-- Race condition: two webhooks update the same reservation concurrently
+- Race condition: two events update the same reservation concurrently
 - Reservation stuck in `calling` state after call ends (missing terminal transition)
 - Call attempts counter exceeds max without triggering failure notification
 
@@ -61,7 +61,7 @@ A system with:
 - Call SID not associated with reservation record
 
 **Security failures:**
-- API keys or Twilio credentials appearing in logs or responses
+- API keys or credentials appearing in logs or responses
 - Webhook endpoints accepting requests without Twilio signature validation
 - SQL injection via unparameterized queries
 - User A able to access User B's reservation details
@@ -69,30 +69,34 @@ A system with:
 ### How to Test Locally (Without Real Calls)
 
 ```python
-# Mock Twilio client for unit tests
-from unittest.mock import MagicMock, patch
+# Mock providers for unit tests
+from unittest.mock import AsyncMock, MagicMock
+from src.providers.base import STTProvider, TTSProvider, LLMProvider
 
+mock_stt = AsyncMock(spec=STTProvider)
+mock_tts = AsyncMock(spec=TTSProvider)
+mock_llm = AsyncMock(spec=LLMProvider)
+
+# Mock Twilio client
 mock_client = MagicMock()
 mock_client.calls.create.return_value = MagicMock(sid="CA_test_12345")
 
-# Simulate webhook callback
+# Simulate status callback
 from fastapi.testclient import TestClient
 from src.api.routes import app
 
 client = TestClient(app)
-response = client.post("/callbacks/voice", data={
+response = client.post("/webhooks/twilio/status", data={
     "CallSid": "CA_test_12345",
-    "CallStatus": "in-progress",
-    "SpeechResult": "Yes, we have a table at 7:30",
+    "CallStatus": "completed",
 })
 assert response.status_code == 200
-assert "<Response>" in response.text  # Valid TwiML
 
-# Test conversation engine in isolation
-engine = ConversationEngine(reservation=mock_reservation)
-response = engine.process_utterance("We can do 8:00 instead")
+# Test conversation engine with mock providers
+providers = {"stt": mock_stt, "tts": mock_tts, "llm": mock_llm}
+engine = ConversationEngine(reservation_id="test", providers=providers)
+response = await engine.process("We can do 8:00 instead")
 assert response.action == "propose_alternative"
-assert response.proposed_time == time(20, 0)
 ```
 
 ## Your Role

@@ -8,42 +8,52 @@ You are the **Builder** in a 3-stage quality pipeline. You write code. Nothing e
 
 ### Tech Stack & Conventions
 
-- **Core imports:** `fastapi`, `twilio`, `openai`, `celery`, `sqlite3`
+- **Core imports:** `fastapi`, `twilio`, `openai`, `celery`, `sqlite3`, `redis`
+- **Provider abstraction:** All external dependencies are behind swappable interfaces in `src/providers/base.py`. Default providers are registered in `configs/providers.py`.
 - **Telephony patterns:**
-  - Outbound call: `twilio.rest.Client().calls.create(to=..., from_=..., url=..., status_callback=...)`
-  - TwiML response: `twilio.twiml.voice_response.VoiceResponse()` with `.say()`, `.gather()`, `.pause()`
-  - Streaming STT: `<Gather input="speech" action="/handle-speech" speechTimeout="auto">`
+  - Outbound call: `twilio.rest.Client().calls.create(to=..., from_=..., twiml=..., status_callback=...)`
+  - Bidirectional audio: `<Connect><Stream url="wss://..."/>` — WebSocket Media Streams, NOT `<Gather>`
+  - Audio format: 8-bit 8kHz µ-law (Twilio native)
   - Call status: Twilio POSTs to `status_callback` URL with `CallStatus` (initiated, ringing, in-progress, completed, failed, busy, no-answer)
-- **LLM patterns:**
-  - Chat completion: `openai.ChatCompletion.create(model=..., messages=[...], functions=[...])`
-  - Function calling for structured decisions (e.g., `confirm_reservation`, `propose_alternative`, `end_call`)
+- **AI patterns (default: all-OpenAI):**
+  - STT: OpenAI Whisper API via `STTProvider` interface
+  - LLM: `openai.chat.completions.create(model=..., messages=[...], tools=[...])` via `LLMProvider` interface
+  - TTS: OpenAI TTS API via `TTSProvider` interface
+  - Function calling for structured decisions (`confirm_reservation`, `propose_alternative`, `end_call`)
   - System prompt defines the agent's persona and negotiation boundaries
 - **State management:**
   - Reservation state machine: `pending → calling → in_conversation → confirmed | alternative_proposed | failed`
-  - Session data keyed by Twilio Call SID in Redis or SQLite
+  - Live session data in Redis via `SessionStore` interface (keyed by Call SID)
+  - Persistent data in SQLite via `Database` interface
   - All state transitions are atomic with DB writes
 - **Async patterns:**
   - Celery task for call initiation: `@celery_app.task(bind=True, max_retries=3)`
-  - FastAPI async endpoints for webhook handlers
+  - FastAPI async endpoints for WebSocket media stream + REST
   - Redis as Celery broker and session store
 
 ### Project File Structure
 
 ```
 configs/
-├── telephony.py        # Twilio credentials, call settings, timeouts
-├── llm.py              # OpenAI model, prompts, temperature
-└── app.py              # FastAPI settings, DB, retry policy
+├── providers.py       # Provider registration — swap providers here
+├── telephony.py       # Twilio credentials, call settings, timeouts
+└── app.py             # FastAPI settings, Redis URL, retry policy
 
 src/
+├── providers/         # Provider interfaces + implementations
+│   ├── base.py        # Abstract interfaces (STTProvider, TTSProvider, LLMProvider, SessionStore, Database)
+│   ├── openai_stt.py  # OpenAI Whisper STT
+│   ├── openai_tts.py  # OpenAI TTS
+│   ├── openai_llm.py  # OpenAI GPT-4o LLM
+│   ├── redis_session.py   # Redis session store
+│   └── sqlite_db.py       # SQLite database
 ├── models/             # reservation.py, call_log.py, enums.py
-├── telephony/          # caller.py, twiml_builder.py, callbacks.py
+├── telephony/          # caller.py, media_stream.py, callbacks.py
 ├── conversation/       # engine.py, prompts.py, state_machine.py
-├── speech/             # stt.py, tts.py
 ├── notifications/      # notifier.py
 ├── api/                # routes.py, schemas.py
 ├── tasks/              # call_task.py (Celery)
-└── db/                 # database.py, migrations/
+└── db/                 # migrations/
 
 tests/
 scripts/
@@ -133,7 +143,7 @@ Your response MUST include all of the following sections:
 - If the design is ambiguous or incomplete, flag it and stop — do not guess
 - Write readable, type-safe code with clear intent
 - Place code in the correct module per the project structure
-- Use Twilio/OpenAI APIs correctly — refer to the patterns above
+- Use provider interfaces correctly — code against `STTProvider`/`TTSProvider`/`LLMProvider`, not specific implementations
 - **Never hardcode API keys or phone numbers** — always use config/env vars
 - **MUST read `.claude/memory/builder.md` before starting work**
 - **MUST append to `.claude/memory/builder.md` after completing work**

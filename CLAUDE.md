@@ -24,15 +24,26 @@ You are a **Senior System Architect and Lead Engineer** — a remote coding part
 ## Tech Stack
 
 - **Language:** Python 3.11+
-- **Telephony:** Twilio Programmable Voice (outbound calls, TwiML, status callbacks)
-- **Speech-to-Text:** Twilio STT (real-time streaming) or Deepgram (as alternative)
-- **Text-to-Speech:** Twilio `<Say>` / ElevenLabs for natural voice
-- **Conversation AI:** OpenAI GPT-4o (function calling for structured decisions)
-- **State management:** SQLite (reservation tracking, call logs, conversation history)
-- **Web framework:** FastAPI (webhook endpoints for Twilio callbacks, user-facing API)
+- **Telephony:** Twilio Programmable Voice (outbound calls, WebSocket Media Streams, status callbacks)
+- **AI Provider:** OpenAI (Whisper STT + GPT-4o LLM + TTS) — all via single SDK
+- **Session store:** Redis (live call context, Celery broker, distributed locks)
+- **Database:** SQLite (reservations, call logs, transcripts, state transitions)
+- **Web framework:** FastAPI (webhook endpoints, WebSocket media stream, user-facing API)
 - **Notifications:** Twilio SMS / email (via SendGrid or similar) for user updates
 - **Task queue:** Celery + Redis (async call orchestration, retry logic)
 - **No heavy external deps** unless justified — prefer standard library + battle-tested APIs
+
+### Provider Abstraction (Core Design Constraint)
+
+Every external dependency is behind a swappable provider interface:
+
+| Component | Interface | Default | Alternatives |
+|-----------|-----------|---------|-------------|
+| STT | `STTProvider` | OpenAI Whisper | Deepgram, faster-whisper (on-device) |
+| TTS | `TTSProvider` | OpenAI TTS | ElevenLabs, Kokoro (on-device) |
+| LLM | `LLMProvider` | OpenAI GPT-4o | Anthropic Claude, local LLM |
+| Session | `SessionStore` | Redis | In-memory, SQLite |
+| Database | `Database` | SQLite | PostgreSQL |
 
 ## Telephony & Conversation Constraints (Standing Context)
 
@@ -104,36 +115,42 @@ reservation-agent/
 ├── docs/
 │   └── PROJECT_PLAN.md
 ├── configs/
-│   ├── telephony.py        # Twilio credentials, call settings, timeouts
-│   ├── llm.py              # OpenAI model config, prompts, temperature
-│   └── app.py              # FastAPI settings, DB path, retry policy
+│   ├── providers.py       # Provider registration — swap providers here
+│   ├── telephony.py       # Twilio credentials, call settings, timeouts
+│   └── app.py             # FastAPI settings, Redis URL, retry policy
 ├── src/
+│   ├── providers/         # Provider interfaces + implementations
+│   │   ├── base.py        # Abstract interfaces (STTProvider, TTSProvider, etc.)
+│   │   ├── openai_stt.py  # OpenAI Whisper STT
+│   │   ├── openai_tts.py  # OpenAI TTS
+│   │   ├── openai_llm.py  # OpenAI GPT-4o LLM
+│   │   ├── redis_session.py   # Redis session store
+│   │   └── sqlite_db.py       # SQLite database
 │   ├── models/             # reservation.py, call_log.py, enums.py
-│   ├── telephony/          # caller.py, twiml_builder.py, callbacks.py
+│   ├── telephony/          # caller.py, media_stream.py, callbacks.py
 │   ├── conversation/       # engine.py, prompts.py, state_machine.py
-│   ├── speech/             # stt.py, tts.py
 │   ├── notifications/      # notifier.py (SMS, email)
 │   ├── api/                # routes.py, schemas.py (user-facing REST API)
 │   ├── tasks/              # call_task.py (Celery async task)
-│   └── db/                 # database.py, migrations/
+│   └── db/                 # migrations/
 ├── tests/
 │   ├── unit/
 │   ├── integration/
 │   └── e2e/
 ├── scripts/
 │   ├── run_server.py
-│   └── simulate_call.py    # Local testing without real phone calls
+│   └── simulate_call.py   # Local call simulation without Twilio
 └── requirements.txt
 ```
 
 ## Milestones
 
-- **M1:** Foundation — project structure, data models, DB setup, user-facing API (submit reservation, check status)
-- **M2:** Telephony — Twilio integration, outbound calls, webhook handling, call state management
-- **M3:** Conversation — LLM-driven dialogue engine, reservation request flow, STT/TTS pipeline
-- **M4:** Negotiation — alternative time proposal, confirmation loops, user notification of alternatives
-- **M5:** Resilience — retry logic, error handling, call failure recovery, transcript logging
-- **M6:** Polish — end-to-end testing, call simulation, monitoring, deployment
+- **M1:** Foundation — provider interfaces, data models, DB setup, user-facing API (submit reservation, check status)
+- **M2:** Telephony — Twilio integration, outbound calls, WebSocket media stream, status callbacks
+- **M3:** Conversation — OpenAI STT/TTS/LLM providers, conversation engine, state machine
+- **M4:** Negotiation — function calling, alt-time validation, confirmation loops, notifications
+- **M5:** Resilience — Celery retry, error handling, transcript persistence, call logging
+- **M6:** Polish — E2E tests, call simulator, monitoring, deployment
 
 ## Core Values
 

@@ -13,7 +13,9 @@ The system has three core workflows:
 
 ### System Constraints You Must Design Around
 
-- **Twilio is webhook-driven** — each call event triggers a stateless HTTP request. Conversation state must be externalized (Redis/DB keyed by Call SID).
+- **Twilio uses WebSocket Media Streams** — bidirectional audio via `<Connect><Stream>` over WebSocket. Conversation state lives in Redis (keyed by Call SID).
+- **Provider abstraction is mandatory** — all external dependencies (STT, TTS, LLM, session store, DB) are behind swappable interfaces in `src/providers/base.py`. Designs must use the interface, not a specific provider.
+- **Default providers: all-OpenAI** — Whisper (STT) + GPT-4o (LLM) + TTS — swappable to Deepgram, ElevenLabs, faster-whisper, Kokoro, etc.
 - **STT is imperfect** — names, times, and numbers have high error rates. Designs must include confirmation loops and disambiguation.
 - **TTS latency + LLM latency compound** — restaurant staff expect natural conversational pacing (~1-2 second response time). Design for async processing, filler utterances, and graceful degradation.
 - **Call cost is per-minute** — conversations must be efficient. Hard cap at ~5 minutes per call.
@@ -27,9 +29,11 @@ The system has three core workflows:
 ```
 User → REST API → Validate → Enqueue call task
     → Celery worker → Twilio outbound call
-        → Twilio webhooks → FastAPI callback handlers
-            → STT stream → LLM conversation engine → TTS response
-            → State machine updates → DB writes
+        → Twilio WebSocket Media Stream (bidirectional)
+            → STTProvider (audio → transcript)
+            → LLMProvider (transcript → response + function calls)
+            → TTSProvider (response → audio)
+            → State machine updates → Database
         → Call ends
     → Notification service → User (SMS/email)
 ```
@@ -38,15 +42,15 @@ User → REST API → Validate → Enqueue call task
 
 ```
 src/
+├── providers/         # base.py (interfaces), openai_stt.py, openai_tts.py, openai_llm.py, redis_session.py, sqlite_db.py
 ├── models/             # reservation.py, call_log.py, enums.py
-├── telephony/          # caller.py, twiml_builder.py, callbacks.py
+├── telephony/          # caller.py, media_stream.py, callbacks.py
 ├── conversation/       # engine.py, prompts.py, state_machine.py
-├── speech/             # stt.py, tts.py
 ├── notifications/      # notifier.py
 ├── api/                # routes.py, schemas.py
 ├── tasks/              # call_task.py (Celery)
-└── db/                 # database.py, migrations/
-configs/                # telephony.py, llm.py, app.py
+└── db/                 # migrations/
+configs/                # providers.py, telephony.py, app.py
 tests/
 scripts/
 ```
