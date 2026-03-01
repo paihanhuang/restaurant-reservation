@@ -1,4 +1,7 @@
-# Restaurant Reservation Agent — Architecture Design
+# Restaurant Reservation Agent — Architecture Design (v2)
+
+> [!NOTE]
+> **v2** incorporates all resolutions from the [architecture critique](file:///home/etem/reservation-agent/Implementation%20Plan/architecture_critique.md). Changes are marked with 🔧 tags linking to the original critique item.
 
 ## Problem Statement
 
@@ -81,6 +84,9 @@ Deepgram Nova-2 is better for phone audio (native 8kHz µ-law support, no resamp
 
 faster-whisper + Kokoro would eliminate all cloud dependencies (except LLM). But they require a GPU, add 2GB+ of model dependencies, need warm-up time, and introduce audio resampling complexity (8kHz µ-law → 16kHz PCM for Whisper). Operational burden is significantly higher. Again — swappable later via provider abstraction.
 
+> [!NOTE]
+> 🔧 **Builder critique: Whisper is batch-only, not streaming.** OpenAI's Whisper API is a batch endpoint — you upload a complete audio file, not a real-time stream. The STT interface is designed for **VAD-chunked batch processing**: accumulate audio until end-of-utterance is detected (via Voice Activity Detection), then transcribe the complete utterance. This fits our turn-based conversation model. See [Decision 6](#decision-6-vad-chunked-stt-not-true-streaming) for details.
+
 ---
 
 ### Decision 3: Provider Abstraction for All External Dependencies
@@ -110,23 +116,21 @@ faster-whisper + Kokoro would eliminate all cloud dependencies (except LLM). But
 
 ### Provider Interface Pattern
 
+🔧 **Builder critique resolved:** STT interface redesigned for VAD-chunked batch model instead of false streaming abstraction.
+
 ```python
-# Abstract base — all providers follow this pattern
 from abc import ABC, abstractmethod
+from typing import AsyncIterator
 
 class STTProvider(ABC):
+    """Transcribes a complete utterance (post-VAD). NOT a streaming interface."""
     @abstractmethod
-    async def create_stream(self) -> STTStream: ...
-
-class STTStream(ABC):
-    @abstractmethod
-    async def send_audio(self, chunk: bytes) -> TranscriptResult | None: ...
-    @abstractmethod
-    async def close(self) -> None: ...
+    async def transcribe(self, audio: bytes, format: str = "wav") -> TranscriptResult: ...
 
 class TTSProvider(ABC):
+    """Synthesizes speech from text. Returns audio chunks for streaming playback."""
     @abstractmethod
-    async def synthesize(self, text: str) -> AsyncIterator[bytes]: ...
+    async def synthesize(self, text: str, output_format: str = "pcm") -> AsyncIterator[bytes]: ...
 
 class LLMProvider(ABC):
     @abstractmethod
@@ -151,6 +155,10 @@ class Database(ABC):
     async def log_state_transition(self, transition: StateTransition) -> None: ...
     @abstractmethod
     async def log_call(self, call_log: CallLog) -> None: ...
+    @abstractmethod
+    async def append_transcript_turn(self, reservation_id: str, turn: TranscriptTurn) -> None: ...
+    @abstractmethod
+    async def get_transcript(self, reservation_id: str) -> list[TranscriptTurn]: ...
 ```
 
 ### Provider Registration
@@ -238,6 +246,48 @@ These four functions cover the complete decision space for a reservation call:
 - Server-side validation can reject invalid actions (e.g., `propose_alternative` with a time outside bounds)
 - The state machine knows exactly what happened and can transition accordingly
 
+🔧 **Shield critique resolved:** All function call outputs are validated server-side before state transitions. See [Validation Layer](#validation-layer) below.
+
+---
+
+### Decision 6: VAD-Chunked STT, Not True Streaming
+
+🔧 **Builder critique: Whisper API is batch-only.**
+
+OpenAI's Whisper API accepts a complete audio file and returns a transcript. It does NOT support real-time WebSocket streaming. This means we need Voice Activity Detection (VAD) to buffer audio into complete utterances before sending to Whisper.
+
+**How it works:**
+
+```
+Twilio Audio Stream (continuous) → VAD (detect speech boundaries) → Buffer full utterance → Whisper API (batch) → Transcript
+```
+
+**VAD approach:**
+
+```python
+class VADProcessor:
+    """Buffers audio chunks, detects end-of-speech, yields complete utterances."""
+
+    def __init__(self, silence_threshold_ms: int = 700, min_speech_ms: int = 300):
+        self.buffer: bytearray = bytearray()
+        self.silence_threshold_ms = silence_threshold_ms  # Silence after speech = end of utterance
+        self.min_speech_ms = min_speech_ms                # Minimum speech to avoid noise triggers
+
+    async def process_chunk(self, audio_chunk: bytes) -> bytes | None:
+        """Returns complete utterance audio when end-of-speech detected, else None."""
+        self.buffer.extend(audio_chunk)
+        if self._detect_end_of_speech():
+            utterance = bytes(self.buffer)
+            self.buffer.clear()
+            return utterance
+        return None
+```
+
+**Why this is acceptable:**
+- Our conversation is turn-based — the restaurant speaks, then the agent speaks. VAD naturally segments at turn boundaries.
+- Added latency (~0.7s after speaker stops) is within acceptable range for phone conversation.
+- If we later swap to Deepgram (true streaming STT), the `STTProvider.transcribe()` interface still works — Deepgram just returns faster.
+
 ---
 
 ## System Architecture
@@ -249,26 +299,31 @@ graph TB
     end
 
     subgraph API Layer
-        API[FastAPI Server<br/>REST + WebSocket]
+        API["FastAPI Server<br/>REST + WebSocket + Rate Limiting"]
     end
 
     subgraph Orchestration Layer
         QUEUE[Celery + Redis<br/>Task Queue]
+        BEAT[Celery Beat<br/>Stale State Cleanup]
     end
 
     subgraph Telephony Layer
         TWILIO[Twilio<br/>Programmable Voice]
-        WS[WebSocket Server<br/>Media Streams Handler]
+        WS["WebSocket Server<br/>Media Streams + Auth"]
+        CODEC[Audio Codec<br/>µ-law ↔ PCM]
+        VAD[VAD Processor<br/>Utterance Detection]
     end
 
     subgraph Speech Layer
-        STT[STTProvider<br/>default: OpenAI Whisper]
+        STT["STTProvider<br/>default: OpenAI Whisper (batch)"]
         TTS[TTSProvider<br/>default: OpenAI TTS]
     end
 
     subgraph Conversation Layer
         ENGINE[Conversation Engine<br/>LLMProvider + Function Calling]
+        VALIDATE[Validation Layer<br/>Time/Date/Bounds Checks]
         SM[State Machine<br/>Reservation Lifecycle]
+        SILENCE[Silence Detector<br/>Hold/Timeout Monitor]
     end
 
     subgraph Data Layer
@@ -285,16 +340,23 @@ graph TB
     API -->|enqueue call task| QUEUE
     QUEUE -->|initiate outbound call| TWILIO
     TWILIO -->|bidirectional WebSocket| WS
-    WS -->|audio stream| STT
+    WS -->|µ-law audio| CODEC
+    CODEC -->|PCM audio| VAD
+    VAD -->|complete utterance| STT
     STT -->|transcript| ENGINE
+    ENGINE -->|function call output| VALIDATE
+    VALIDATE -->|validated action| SM
     ENGINE -->|response text| TTS
-    TTS -->|audio stream| WS
+    TTS -->|PCM audio| CODEC
+    CODEC -->|µ-law audio| WS
     ENGINE -->|state transitions| SM
     SM -->|persist| DB
     ENGINE -->|conversation context| SESSION
     SM -->|on terminal state| NOTIFY
     NOTIFY -->|SMS/email| USER
     API -->|query| DB
+    BEAT -->|timeout scan| SM
+    SILENCE -->|hold/timeout events| ENGINE
 ```
 
 ---
@@ -312,8 +374,27 @@ graph TB
 | `GET` | `/reservations/{id}/transcript` | Retrieve call transcript |
 | `POST` | `/reservations/{id}/confirm-alternative` | User confirms proposed alternative |
 | `POST` | `/reservations/{id}/cancel` | Cancel pending reservation |
-| `POST` | `/webhooks/twilio/status` | Twilio call status callback |
-| `WebSocket` | `/ws/media-stream/{call_sid}` | Twilio bidirectional media stream |
+| `POST` | `/webhooks/twilio/status` | Twilio call status callback (with signature validation) |
+| `WebSocket` | `/ws/media-stream/{reservation_id}?token={auth_token}` | Twilio bidirectional media stream |
+| `GET` | `/health` | Liveness check — server is up |
+| `GET` | `/readiness` | Dependency check — Redis, Twilio reachable |
+
+🔧 **Shield critiques resolved:**
+- WebSocket URL uses `reservation_id` (not `call_sid`) + short-lived auth `token` generated at `calls.create()` time
+- Rate limiting middleware added (see below)
+- `/health` and `/readiness` endpoints added
+
+#### Rate Limiting
+
+```python
+# Middleware: per-user rate limits
+RATE_LIMITS = {
+    "POST /reservations": "5/minute",
+    "GET /reservations/{id}": "30/minute",
+    "POST /reservations/{id}/confirm-alternative": "5/minute",
+    "global": "100/minute",
+}
+```
 
 #### Key schemas
 
@@ -323,18 +404,34 @@ class ReservationRequest(BaseModel):
     restaurant_phone: str           # E.164 format
     date: date                      # Must be future
     preferred_time: time
-    alt_time_window: tuple[time, time] | None  # Negotiation bounds
+    alt_time_window: TimeWindow | None  # Negotiation bounds (see below)
     party_size: int                 # 1-20
     special_requests: str | None
     user_contact: UserContact       # phone + email for notifications
+
+class TimeWindow(BaseModel):
+    """Single contiguous range. None means 'preferred time only, no alternatives.'"""
+    start: time
+    end: time
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.start >= self.end:
+            raise ValueError("alt_time_window.start must be before end")
+        return self
 
 class ReservationResponse(BaseModel):
     reservation_id: UUID
     status: ReservationStatus
     confirmed_time: time | None
     call_attempts: int
-    transcript: str | None
+    transcript: list[TranscriptTurn] | None
 ```
+
+🔧 **Architect critique resolved:** `alt_time_window` semantics are now explicit:
+- `None` = preferred time only, no alternatives accepted
+- `TimeWindow(start, end)` = single contiguous range on the same date
+- Multi-range or different-date flexibility is out of scope for v1
 
 ---
 
@@ -348,9 +445,10 @@ def place_reservation_call(self, reservation_id: str):
     """
     1. Load reservation from DB
     2. Validate still in 'pending' or 'retry' state
-    3. Initiate Twilio outbound call with Media Stream URL
-    4. Update state to 'calling'
-    5. On failure/timeout → retry with exponential backoff
+    3. Generate short-lived WebSocket auth token, store in Redis
+    4. Initiate Twilio outbound call with Media Stream URL + token
+    5. Update state to 'calling'
+    6. On failure/timeout → retry with exponential backoff
     """
 ```
 
@@ -364,6 +462,51 @@ def place_reservation_call(self, reservation_id: str):
 
 **Why max 3 attempts:** Diminishing returns. If a restaurant doesn't answer 3 times, they're likely closed, too busy, or the number is wrong. Better to notify the user and let them decide.
 
+#### Process Model
+
+🔧 **Builder critique resolved:** Explicit process architecture.
+
+```
+Process A: FastAPI (uvicorn)
+    - REST API endpoints
+    - WebSocket media stream handler
+    - Serves on port 8000
+
+Process B: Celery Worker
+    - Picks up call tasks from Redis broker
+    - Calls twilio_client.calls.create()
+    - Has its own Twilio client instance
+    - Reports results via DB writes + Redis session updates
+
+Process C: Celery Beat (scheduler)
+    - Runs periodic stale-state cleanup task
+    - Runs periodic transcript flush task
+
+All 3 processes: same codebase, same configs, connect to same Redis + SQLite.
+Start command: scripts/run_server.py starts all 3.
+```
+
+#### Stale State Cleanup (Celery Beat)
+
+🔧 **Shield critique resolved:** Time-based state transitions.
+
+```python
+@celery_app.task
+def cleanup_stale_reservations():
+    """Runs every 5 minutes via Celery Beat."""
+    now = utcnow()
+    # Reservations stuck in 'calling' for > 10 min → retry or failed
+    stale_calling = db.get_reservations_by_status("calling", older_than=now - 10min)
+    for r in stale_calling:
+        state_machine.transition(r.id, "retry" if r.call_attempts < 3 else "failed")
+
+    # Reservations in 'alternative_proposed' for > 24 hours → failed
+    stale_alt = db.get_reservations_by_status("alternative_proposed", older_than=now - 24h)
+    for r in stale_alt:
+        state_machine.transition(r.id, "failed", trigger="user_timeout")
+        notify(r, "Your alternative time offer has expired.")
+```
+
 ---
 
 ### 3. Telephony Layer (`src/telephony/`)
@@ -372,54 +515,150 @@ def place_reservation_call(self, reservation_id: str):
 
 #### Call initiation flow
 
+🔧 **Architect + Builder + Shield critiques resolved:** Voicemail detection, auth token, TwiML via SDK, call timeout.
+
 ```python
-def initiate_call(reservation: Reservation) -> str:
-    """Returns Call SID"""
+import secrets
+from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
+
+def initiate_call(reservation: Reservation, session_store: SessionStore) -> str:
+    # Generate short-lived auth token for WebSocket
+    auth_token = secrets.token_urlsafe(32)
+    await session_store.set(
+        f"ws_token:{reservation.reservation_id}",
+        {"token": auth_token},
+        ttl=60  # Token valid for 60 seconds
+    )
+
+    response = VoiceResponse()
+    connect = Connect()
+    stream = Stream(
+        url=f"wss://{HOST}/ws/media-stream/{reservation.reservation_id}?token={auth_token}"
+    )
+    connect.append(stream)
+    response.append(connect)
+
     call = twilio_client.calls.create(
         to=reservation.restaurant_phone,
         from_=TWILIO_PHONE_NUMBER,
-        twiml=f'''
-            <Response>
-                <Connect>
-                    <Stream url="wss://{HOST}/ws/media-stream/{reservation.reservation_id}"
-                            statusCallbackUrl="{HOST}/webhooks/twilio/status" />
-                </Connect>
-            </Response>
-        ''',
+        twiml=str(response),
+        timeout=30,                   # Ring timeout: 30s before no-answer
+        time_limit=300,               # Hard cap: 5 minutes (🔧 Shield critique)
+        machine_detection="Enable",   # Voicemail detection (🔧 Architect critique)
         status_callback=f"{HOST}/webhooks/twilio/status",
         status_callback_event=["initiated", "ringing", "answered", "completed"],
     )
     return call.sid
 ```
 
+#### Audio Codec Layer
+
+🔧 **Architect critique resolved:** Explicit µ-law ↔ PCM conversion.
+
+```python
+# src/telephony/audio_codec.py
+import audioop
+
+class AudioCodec:
+    """Converts between Twilio's µ-law 8kHz and PCM formats."""
+
+    @staticmethod
+    def mulaw_to_pcm(mulaw_bytes: bytes) -> bytes:
+        """Convert 8-bit µ-law to 16-bit PCM."""
+        return audioop.ulaw2lin(mulaw_bytes, 2)  # 2 = 16-bit samples
+
+    @staticmethod
+    def pcm_to_mulaw(pcm_bytes: bytes) -> bytes:
+        """Convert 16-bit PCM to 8-bit µ-law."""
+        return audioop.lin2ulaw(pcm_bytes, 2)
+
+    @staticmethod
+    def resample_8k_to_16k(pcm_8k: bytes) -> bytes:
+        """Resample 8kHz PCM to 16kHz for Whisper."""
+        return audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)[0]
+
+    @staticmethod
+    def resample_16k_to_8k(pcm_16k: bytes) -> bytes:
+        """Resample 16kHz PCM back to 8kHz for Twilio."""
+        return audioop.ratecv(pcm_16k, 2, 1, 16000, 8000, None)[0]
+```
+
 #### Media stream WebSocket handler
+
+🔧 **Multiple critiques resolved:** Auth token validation, greeting trigger, call timeout watchdog, silence detection, structured cleanup.
 
 ```python
 async def handle_media_stream(websocket, reservation_id, providers):
-    stt = await providers["stt"].create_stream()
-    tts = providers["tts"]
+    # 1. Authenticate WebSocket connection
+    token = websocket.query_params.get("token")
+    stored = await providers["session"].get(f"ws_token:{reservation_id}")
+    if not stored or stored["token"] != token:
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+    await providers["session"].delete(f"ws_token:{reservation_id}")  # Single-use token
+
+    # 2. Initialize components
+    codec = AudioCodec()
+    vad = VADProcessor(silence_threshold_ms=700)
+    silence_detector = SilenceDetector(hold_timeout_s=30, max_silence_s=120)
     conversation = ConversationEngine(reservation_id, providers)
+    stream_sid = None
 
-    async for message in websocket:
-        event = json.loads(message)
+    try:
+        async with asyncio.timeout(300):  # 5-minute hard watchdog
+            async for message in websocket:
+                event = json.loads(message)
 
-        if event["event"] == "media":
-            audio_chunk = base64.b64decode(event["media"]["payload"])
-            transcript = await stt.send_audio(audio_chunk)
+                if event["event"] == "start":
+                    stream_sid = event["start"]["streamSid"]
+                    # 🔧 Architect critique: deliver opening greeting
+                    greeting = await conversation.get_greeting()
+                    await _send_speech(websocket, stream_sid, greeting, providers["tts"], codec)
 
-            if transcript and transcript.is_final:
-                response = await conversation.process(transcript.text)
-                async for audio_chunk in tts.synthesize(response.speech_text):
-                    await websocket.send(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": base64.b64encode(audio_chunk).decode()}
-                    }))
-                await conversation.handle_action(response)
+                elif event["event"] == "media":
+                    audio_mulaw = base64.b64decode(event["media"]["payload"])
+                    audio_pcm = codec.mulaw_to_pcm(audio_mulaw)
 
-        elif event["event"] == "stop":
-            await stt.close()
-            await conversation.finalize()
+                    # Track silence / hold
+                    silence_event = silence_detector.process(audio_pcm)
+                    if silence_event == "prompt_check":
+                        await _send_speech(websocket, stream_sid, "Hello, are you still there?", providers["tts"], codec)
+                        continue
+                    elif silence_event == "timeout":
+                        await conversation.handle_action(Action("end_call", reason="Extended hold timeout"))
+                        break
+
+                    # VAD: buffer until end-of-utterance
+                    audio_16k = codec.resample_8k_to_16k(audio_pcm)
+                    utterance = await vad.process_chunk(audio_16k)
+
+                    if utterance:
+                        # Batch transcribe complete utterance
+                        transcript = await providers["stt"].transcribe(utterance)
+                        if transcript and transcript.text.strip():
+                            response = await conversation.process(transcript.text)
+                            await _send_speech(websocket, stream_sid, response.speech_text, providers["tts"], codec)
+                            await conversation.handle_action(response)
+
+                elif event["event"] == "stop":
+                    break
+
+    except asyncio.TimeoutError:
+        await conversation.handle_action(Action("end_call", reason="Call duration exceeded"))
+    finally:
+        # 🔧 Shield critique: always persist transcript on exit
+        await conversation.finalize()
+
+async def _send_speech(websocket, stream_sid, text, tts, codec):
+    """Synthesize text and send audio back to Twilio."""
+    async for audio_pcm in tts.synthesize(text):
+        audio_8k = codec.resample_16k_to_8k(audio_pcm)
+        audio_mulaw = codec.pcm_to_mulaw(audio_8k)
+        await websocket.send(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": base64.b64encode(audio_mulaw).decode()}
+        }))
 ```
 
 ---
@@ -436,8 +675,8 @@ RESERVATION_FUNCTIONS = [
         "name": "confirm_reservation",
         "description": "Restaurant confirms the reservation at the requested or proposed time",
         "parameters": {
-            "confirmed_time": {"type": "string", "description": "HH:MM format"},
-            "confirmed_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "confirmed_time": {"type": "string", "description": "24-hour HH:MM format (e.g. 19:30)"},
+            "confirmed_date": {"type": "string", "description": "ISO format YYYY-MM-DD"},
             "special_notes": {"type": "string", "description": "Any notes from restaurant"},
         }
     },
@@ -445,7 +684,7 @@ RESERVATION_FUNCTIONS = [
         "name": "propose_alternative",
         "description": "Restaurant offers an alternative time. Only call if within user's flexibility window.",
         "parameters": {
-            "proposed_time": {"type": "string", "description": "HH:MM format"},
+            "proposed_time": {"type": "string", "description": "24-hour HH:MM format (e.g. 20:15)"},
             "reason": {"type": "string", "description": "Why original time unavailable"},
         }
     },
@@ -466,6 +705,61 @@ RESERVATION_FUNCTIONS = [
 ]
 ```
 
+#### Validation Layer
+
+🔧 **Shield critique resolved:** All function call outputs are validated before state transitions.
+
+```python
+# src/conversation/validators.py
+from datetime import time, date, datetime
+
+def parse_time_strict(raw: str) -> time:
+    """Parse HH:MM 24-hour format only. Raises ValueError on anything else."""
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M").time()
+    except ValueError:
+        raise ValueError(f"Invalid time format: '{raw}'. Expected HH:MM (24-hour).")
+
+def parse_date_strict(raw: str) -> date:
+    """Parse YYYY-MM-DD only. Raises ValueError on anything else."""
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"Invalid date format: '{raw}'. Expected YYYY-MM-DD.")
+
+def validate_proposed_time(proposed: time, window: TimeWindow | None) -> bool:
+    """Check if proposed time is within user's flexibility window."""
+    if window is None:
+        return False  # No alternatives accepted
+    return window.start <= proposed <= window.end
+
+def validate_confirmed_date(confirmed: date, expected: date) -> bool:
+    """Confirmed date must match the reservation date."""
+    return confirmed == expected
+```
+
+**Validation enforcement in the engine:**
+
+```python
+async def handle_action(self, response: LLMResponse):
+    if response.action == "confirm_reservation":
+        confirmed_time = parse_time_strict(response.params["confirmed_time"])
+        confirmed_date = parse_date_strict(response.params["confirmed_date"])
+        if not validate_confirmed_date(confirmed_date, self.reservation.date):
+            # Date mismatch — re-prompt LLM
+            await self._reprompt("The date you confirmed doesn't match. Please verify.")
+            return
+        # ... proceed with state transition
+
+    elif response.action == "propose_alternative":
+        proposed_time = parse_time_strict(response.params["proposed_time"])
+        if not validate_proposed_time(proposed_time, self.reservation.alt_time_window):
+            # Outside bounds — agent should reject
+            await self._reprompt("That time is outside the acceptable range. Please decline politely.")
+            return
+        # ... proceed with state transition
+```
+
 #### System prompt structure
 
 ```
@@ -482,14 +776,16 @@ NEGOTIATION BOUNDS:
 - You may accept alternative times between {alt_start} and {alt_end}
 - You may NOT change the party size or date
 - If no acceptable time is available, end the call politely
+- All times must be in 24-hour HH:MM format (e.g., 19:30, not 7:30 PM)
+- All dates must be in YYYY-MM-DD format
 
 BEHAVIOR RULES:
 - Identify yourself: "Hi, I'm calling to make a reservation on behalf of a guest."
 - Be concise — restaurant staff are busy
 - Always confirm details before ending: repeat date, time, party size, name
-- If asked to hold, wait patiently (up to 30 seconds of silence)
+- If asked to hold, wait patiently (the system will handle hold detection)
 - If transferred, re-introduce yourself
-- If you reach voicemail, hang up (retry will be handled automatically)
+- If you reach voicemail, use end_call with reason "voicemail"
 
 DISCLOSURE (required): Mention that you are an automated booking assistant.
 ```
@@ -497,6 +793,7 @@ DISCLOSURE (required): Mention that you are an automated booking assistant.
 #### Conversation context management
 
 - Maintain rolling transcript in Redis (via `SessionStore`), keyed by `call_sid`
+- **Also write each turn to SQLite** via `Database.append_transcript_turn()` for durability (🔧 Shield critique)
 - Context window: last 20 turns (or ~2000 tokens) — summarize older turns
 - Each turn: `{ role: "restaurant" | "agent", text: str, timestamp: float }`
 
@@ -510,16 +807,23 @@ stateDiagram-v2
     pending --> calling : Call task picked up
     calling --> in_conversation : Restaurant answers
     calling --> retry : Busy / No answer / Dropped
+    calling --> failed : Stale state timeout (10 min)
     retry --> calling : Retry attempt
     retry --> failed : Max retries exceeded
     in_conversation --> confirmed : Reservation confirmed
     in_conversation --> alternative_proposed : Restaurant offers alt time
     in_conversation --> failed : No reservation possible
+    in_conversation --> failed : Call duration timeout (5 min)
     alternative_proposed --> confirmed : User accepts alternative
-    alternative_proposed --> failed : User rejects / timeout
+    alternative_proposed --> failed : User rejects / 24h timeout
     confirmed --> [*]
     failed --> [*]
 ```
+
+🔧 **Shield critique resolved:** Added timeout transitions:
+- `calling` → `failed` after 10 minutes (via Celery Beat cleanup)
+- `in_conversation` → `failed` on call duration timeout (5 min watchdog)
+- `alternative_proposed` → `failed` after 24 hours (via Celery Beat cleanup)
 
 **Transition rules:**
 - All transitions are atomic (DB write in single transaction)
@@ -539,15 +843,18 @@ When the restaurant offers an alternative time, we need user consent before conf
 | Event | Channel | Content |
 |-------|---------|---------|
 | Confirmed | SMS + Email | "Your reservation at {restaurant} is confirmed for {date} at {time}, party of {size}." |
-| Alternative proposed | SMS + Email | "Alternative offered: {date} at {alt_time}. Reply CONFIRM or REJECT." |
+| Alternative proposed | SMS + Email | "Alternative offered: {date} at {alt_time}. Reply CONFIRM or REJECT within 24 hours." |
 | Failed | SMS + Email | "Unable to book at {restaurant}. Reason: {reason}. Transcript available at {link}." |
 | Max retries | SMS + Email | "Could not reach {restaurant} after 3 attempts." |
+| Alt timeout | SMS + Email | "Your alternative time offer has expired." |
 
 ---
 
 ## Data Layer
 
 ### SQLite Schema
+
+🔧 **Architect critique resolved:** Added structured `transcript_turns` table instead of single text blob.
 
 ```sql
 CREATE TABLE reservations (
@@ -565,9 +872,18 @@ CREATE TABLE reservations (
     call_attempts INTEGER NOT NULL DEFAULT 0,
     call_sid TEXT,
     confirmed_time TEXT,
-    transcript TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE transcript_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL REFERENCES reservations(reservation_id),
+    call_sid TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('restaurant', 'agent')),
+    text TEXT NOT NULL,
+    timestamp TEXT NOT NULL
 );
 
 CREATE TABLE call_logs (
@@ -591,6 +907,14 @@ CREATE TABLE state_transitions (
     call_sid TEXT,
     timestamp TEXT NOT NULL
 );
+
+-- View: full transcript as text for backward compatibility
+CREATE VIEW transcript_view AS
+SELECT reservation_id,
+       GROUP_CONCAT(role || ': ' || text, CHAR(10)) AS full_transcript
+FROM transcript_turns
+GROUP BY reservation_id
+ORDER BY turn_number;
 ```
 
 ### Redis Keys
@@ -599,6 +923,7 @@ CREATE TABLE state_transitions (
 |-------------|-----|---------|
 | `session:{call_sid}` | 10 min | Active call conversation context |
 | `reservation:{id}:lock` | 30 sec | Prevent concurrent state transitions |
+| `ws_token:{reservation_id}` | 60 sec | WebSocket authentication token (🔧 Shield) |
 
 ---
 
@@ -609,24 +934,29 @@ reservation-agent/
 ├── configs/
 │   ├── providers.py       # Provider registration — swap providers here
 │   ├── telephony.py       # Twilio creds, phone number, timeouts
-│   └── app.py             # FastAPI, Redis URL, retry policy
+│   └── app.py             # FastAPI, Redis URL, retry policy, rate limits
 ├── src/
 │   ├── providers/         # Provider interface + implementations
 │   │   ├── base.py        # Abstract interfaces (STTProvider, TTSProvider, etc.)
-│   │   ├── openai_stt.py  # OpenAI Whisper STT implementation
+│   │   ├── openai_stt.py  # OpenAI Whisper STT (batch with VAD)
 │   │   ├── openai_tts.py  # OpenAI TTS implementation
 │   │   ├── openai_llm.py  # OpenAI GPT-4o LLM implementation
 │   │   ├── redis_session.py   # Redis session store implementation
 │   │   └── sqlite_db.py       # SQLite database implementation
 │   ├── api/
-│   │   ├── routes.py      # REST endpoints + WebSocket media stream
-│   │   └── schemas.py     # Pydantic request/response models
+│   │   ├── routes.py      # REST endpoints + WebSocket media stream + health
+│   │   ├── schemas.py     # Pydantic request/response models
+│   │   └── middleware.py  # Rate limiting, Twilio signature validation
 │   ├── telephony/
-│   │   ├── caller.py      # Twilio outbound call initiation
-│   │   ├── media_stream.py # WebSocket handler for bidirectional audio
-│   │   └── callbacks.py   # Status callback handler
+│   │   ├── caller.py      # Twilio outbound call initiation (with voicemail detection)
+│   │   ├── media_stream.py # WebSocket handler (auth, codec, VAD, silence)
+│   │   ├── audio_codec.py # µ-law ↔ PCM conversion + resampling
+│   │   ├── vad.py         # Voice Activity Detection for utterance segmentation
+│   │   ├── silence.py     # Silence/hold detection and timeout
+│   │   └── callbacks.py   # Status callback handler (with signature validation)
 │   ├── conversation/
 │   │   ├── engine.py      # LLM conversation engine + function calling
+│   │   ├── validators.py  # Time/date parsing + bounds validation
 │   │   ├── prompts.py     # System prompt templates
 │   │   └── state_machine.py # Reservation lifecycle states
 │   ├── notifications/
@@ -634,9 +964,11 @@ reservation-agent/
 │   ├── models/
 │   │   ├── reservation.py # Reservation model
 │   │   ├── call_log.py    # Call log model
+│   │   ├── transcript.py  # TranscriptTurn model
 │   │   └── enums.py       # ReservationStatus, CallStatus enums
 │   ├── tasks/
-│   │   └── call_task.py   # Celery task for async call orchestration
+│   │   ├── call_task.py   # Celery task for async call orchestration
+│   │   └── cleanup_task.py # Celery Beat: stale state cleanup + transcript flush
 │   └── db/
 │       └── migrations/    # Schema versioning
 ├── tests/
@@ -644,9 +976,44 @@ reservation-agent/
 │   ├── integration/
 │   └── e2e/
 ├── scripts/
-│   ├── run_server.py
+│   ├── run_server.py      # Starts FastAPI + Celery Worker + Celery Beat
 │   └── simulate_call.py   # Local call simulation without Twilio
 └── requirements.txt
+```
+
+---
+
+## Dependencies (`requirements.txt`)
+
+🔧 **Builder critique resolved:** Explicit dependency list.
+
+```
+# Core
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0     # WebSocket support requires 'standard'
+pydantic>=2.5.0               # v2 — model_validator, etc.
+
+# AI / Speech
+openai>=1.12.0                # v1.x API (client.chat.completions.create)
+
+# Telephony
+twilio>=9.0.0
+
+# Task Queue
+celery[redis]>=5.3.0
+redis>=5.0.0
+
+# Database
+# sqlite3 is stdlib — no pip dependency
+
+# Logging
+structlog>=24.1.0
+
+# Dev / Test
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+httpx>=0.27.0                 # For FastAPI TestClient async
 ```
 
 ---
@@ -655,13 +1022,18 @@ reservation-agent/
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| LLM agrees outside negotiation bounds | High | Function calling constrains output; `propose_alternative` validates against `alt_time_window` server-side before accepting |
-| STT misrecognizes time | High | Confirmation loop in prompt; parsed time validated against bounds |
-| Call drops mid-conversation | Medium | `stop` event on WebSocket triggers graceful state save; retry picks up from last known state |
+| LLM agrees outside negotiation bounds | High | Function calling constrains output; validation layer rejects invalid times/dates; re-prompts LLM on failure |
+| STT misrecognizes time | High | Confirmation loop in prompt; `parse_time_strict` rejects non-HH:MM; validated against bounds |
+| Call drops mid-conversation | Medium | `stop` event + `finally` block persists transcript; retry picks up from last state |
 | Concurrent events race on state | Medium | Redis lock on reservation ID with 30s TTL |
-| LLM latency > 2s (awkward silence) | Medium | Pre-generated filler phrases; TTS streaming starts before full response generated |
+| LLM latency > 2s (awkward silence) | Medium | Pre-generated filler phrases; TTS streaming starts before full response |
 | Twilio webhook replay/duplicate | Low | Idempotency via `call_sid` + event sequence dedup |
 | Credential leak | High | All secrets via env vars; structlog filters sensitive fields |
+| WebSocket hijacking | High | Short-lived auth token generated per call, validated on connect, single-use |
+| Unlimited call duration | High | `time_limit=300` on Twilio + server-side `asyncio.timeout(300)` watchdog |
+| Stale reservations stuck forever | Medium | Celery Beat scans every 5 min; timeout transitions for all non-terminal states |
+| API abuse / DDoS | Medium | Rate limiting middleware; per-user and global limits |
+| Transcript loss on crash | Medium | Dual-write: Redis (hot) + SQLite (durable) per turn |
 
 ---
 
@@ -669,12 +1041,12 @@ reservation-agent/
 
 | Phase | Milestone | What to Build | Dependencies |
 |-------|-----------|---------------|-------------|
-| 1 | M1: Foundation | Provider interfaces, DB schema, models, enums, REST API (create + get), configs | None |
-| 2 | M2: Telephony | Twilio caller, WebSocket media stream handler, status callbacks | M1 |
-| 3 | M3: Conversation | OpenAI STT/TTS/LLM providers, conversation engine, prompts, state machine | M1, M2 |
-| 4 | M4: Negotiation | Function calling, alt-time validation, confirmation loops, user notification of alternatives | M3 |
-| 5 | M5: Resilience | Celery retry logic, error handling, transcript persistence, call logging | M2, M3 |
-| 6 | M6: Polish | E2E test suite, call simulator, monitoring, deployment config | All |
+| 1 | M1: Foundation | Provider interfaces (`base.py`), DB schema + migrations, models, enums, REST API (create + get + health), configs, `requirements.txt`, rate limiting middleware | None |
+| 2 | M2: Telephony | Twilio caller (voicemail detection, auth token), WebSocket handler, audio codec, VAD, silence detector, status callbacks (signature validation), call timeout | M1 |
+| 3 | M3: Conversation | OpenAI STT/TTS/LLM providers, conversation engine, prompts, validators, state machine, greeting flow | M1, M2 |
+| 4 | M4: Negotiation | Function calling integration, alt-time validation, confirmation loops, user notification of alternatives | M3 |
+| 5 | M5: Resilience | Celery retry logic, Celery Beat cleanup tasks, error handling, transcript dual-write, call logging, readiness endpoint | M2, M3 |
+| 6 | M6: Polish | E2E test suite (defined scenarios), call simulator, monitoring, deployment config | All |
 
 ---
 
@@ -695,11 +1067,28 @@ pytest tests/ --cov=src --cov-report=term-missing
 pytest tests/unit/test_state_machine.py -v
 ```
 
-### Call Simulation (scripts/simulate_call.py)
+### E2E Test Scenarios
+
+🔧 **Shield critique resolved:** Defined scenario list.
+
+| # | Scenario | Expected Outcome |
+|---|----------|-----------------|
+| 1 | Happy path | call → restaurant confirms → `confirmed` → notification |
+| 2 | Negotiation | call → restaurant proposes alt → user confirms → `confirmed` |
+| 3 | Rejection | call → restaurant no availability → `failed` → notification |
+| 4 | Retry on busy | call → busy signal → retry → restaurant answers → `confirmed` |
+| 5 | Voicemail | call → voicemail detected → hang up → retry |
+| 6 | Hold handling | call → "please hold" → silence detection → resume → `confirmed` |
+| 7 | Max retries | call → no answer × 3 → `failed` → notification |
+| 8 | Call timeout | call → conversation exceeds 5 min → forced end → `failed` |
+| 9 | Alt timeout | alternative proposed → no user response for 24h → `failed` |
+| 10 | Concurrent calls | two reservations simultaneously → no state race conditions |
+
+### Call Simulation (`scripts/simulate_call.py`)
 
 Mock Twilio + restaurant responses locally:
 - Simulates WebSocket connection with pre-recorded audio
-- Tests full pipeline: STT → LLM → TTS → state transitions
+- Tests full pipeline: VAD → STT → LLM → TTS → codec → state transitions
 - Validates transcript logging and notification dispatch
 
 ### Manual Verification
