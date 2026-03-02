@@ -24,6 +24,7 @@ import os
 import sys
 import signal
 import time
+import threading
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -147,7 +148,7 @@ def main():
     app = FastAPI(title="Live Call Server")
 
     # Shared state
-    engine_holder = {"engine": None, "sms_sent": False}
+    engine_holder = {"engine": None, "sms_sent": False, "confirmed": False}
 
     @app.on_event("startup")
     async def setup_engine():
@@ -232,21 +233,36 @@ def main():
 
         speech = result.get("speech_text", "")
         action = result.get("action")
+        ended = result.get("ended", False)
+
+        print(f"  {DIM}   [DEBUG] action={action}, ended={ended}, speech={'yes' if speech else 'no'}{RESET}")
 
         if speech:
             print(f"  {BLUE}{BOLD}🤖 Agent:{RESET} {speech}")
 
-        # Handle actions
+        # Handle actions — send SMS in background thread so it doesn't
+        # block the TwiML response back to Twilio
         if action:
             if action == "confirm_reservation":
                 print(f"\n  {CYAN}⚡ ACTION: {BOLD}CONFIRMED!{RESET}")
-                _send_confirmation_sms(reservation, required)
+                engine_holder["confirmed"] = True
+                threading.Thread(
+                    target=_send_confirmation_sms,
+                    args=(reservation, required),
+                    daemon=True,
+                ).start()
             elif action == "propose_alternative":
                 print(f"\n  {MAGENTA}⚡ ACTION: {BOLD}ALTERNATIVE PROPOSED{RESET}")
                 params = result.get("params", {})
-                _send_alternative_sms(reservation, params, required)
+                threading.Thread(
+                    target=_send_alternative_sms,
+                    args=(reservation, params, required),
+                    daemon=True,
+                ).start()
             elif action == "end_call":
                 print(f"\n  {YELLOW}⚡ ACTION: {BOLD}CALL ENDED{RESET}")
+        else:
+            print(f"  {DIM}   [DEBUG] No action in this turn{RESET}")
 
         # Build TwiML response
         response = VoiceResponse()
@@ -323,6 +339,9 @@ def main():
     except KeyboardInterrupt:
         print(f"\n\n{YELLOW}📞 Session ended.{RESET}")
     finally:
+        # Give background SMS threads time to complete
+        time.sleep(2)
+
         ngrok.disconnect(tunnel.public_url)
         server.should_exit = True
         print(f"{DIM}{'─' * 60}{RESET}")
@@ -331,15 +350,23 @@ def main():
         if engine:
             print(f"   Turns: {engine.turn_number}")
             print(f"   Ended: {engine.ended}")
+            print(f"   Confirmed: {engine_holder.get('confirmed', False)}")
+
+            # Fallback: if confirmation happened but SMS didn't send
+            if engine_holder.get("confirmed") and not engine_holder.get("sms_sent"):
+                print(f"\n  {YELLOW}📱 Sending fallback SMS...{RESET}")
+                _send_confirmation_sms(reservation, required)
+
         print(f"{DIM}{'─' * 60}{RESET}\n")
 
 
 def _send_confirmation_sms(reservation: dict, env: dict):
-    """Send confirmation SMS via Twilio."""
+    """Send confirmation SMS via Twilio (called from background thread)."""
+    print(f"  {DIM}   [SMS] Attempting to send confirmation SMS...{RESET}")
     try:
         from twilio.rest import Client
         client = Client(env["TWILIO_ACCOUNT_SID"], env["TWILIO_AUTH_TOKEN"])
-        client.messages.create(
+        msg = client.messages.create(
             body=(
                 f"🎉 Reservation Confirmed!\n\n"
                 f"📍 {reservation['restaurant_name']}\n"
@@ -351,9 +378,9 @@ def _send_confirmation_sms(reservation: dict, env: dict):
             from_=env["TWILIO_PHONE_NUMBER"],
             to=env["USER_PHONE"],
         )
-        print(f"  {GREEN}📱 SMS confirmation sent to {env['USER_PHONE']}{RESET}")
+        print(f"  {GREEN}📱 SMS confirmation sent! SID: {msg.sid}{RESET}")
     except Exception as e:
-        print(f"  {RED}📱 SMS failed: {e}{RESET}")
+        print(f"  {RED}📱 SMS FAILED: {type(e).__name__}: {e}{RESET}")
 
 
 def _send_alternative_sms(reservation: dict, params: dict, env: dict):
