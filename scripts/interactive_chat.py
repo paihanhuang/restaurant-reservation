@@ -4,11 +4,13 @@
 Features:
   🔊 Agent speaks its responses aloud via OpenAI TTS
   📞 Agent can provide a callback phone number when asked
+  📱 Sends real SMS to your cell on confirmation/alternative
   🧠 Real GPT-4o powers the conversation
 
 Usage:
     .venv/bin/python scripts/interactive_chat.py
     .venv/bin/python scripts/interactive_chat.py --no-voice   # text only
+    .venv/bin/python scripts/interactive_chat.py --no-sms     # skip SMS
 
 Type 'quit' or 'exit' at any prompt to hang up.
 """
@@ -103,6 +105,42 @@ class TTSPlayer:
                 pass
 
 
+class SMSNotifier:
+    """Sends real SMS via Twilio."""
+
+    def __init__(self):
+        self.account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        self.auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+        self.from_phone = os.environ.get("TWILIO_PHONE_NUMBER")
+        self.to_phone = os.environ.get("USER_PHONE")
+        self.enabled = all([
+            self.account_sid,
+            self.auth_token,
+            self.from_phone,
+            self.to_phone,
+            self.to_phone != "+1XXXXXXXXXX",  # Not placeholder
+        ])
+
+    def send(self, body: str) -> bool:
+        """Send an SMS. Returns True if successful."""
+        if not self.enabled:
+            return False
+
+        try:
+            from twilio.rest import Client
+            client = Client(self.account_sid, self.auth_token)
+            message = client.messages.create(
+                body=body,
+                from_=self.from_phone,
+                to=self.to_phone,
+            )
+            print(f"  {GREEN}📱 SMS sent to {self.to_phone} (SID: {message.sid}){RESET}")
+            return True
+        except Exception as e:
+            print(f"  {RED}📱 SMS failed: {e}{RESET}")
+            return False
+
+
 def print_banner():
     print(f"""
 {BOLD}{CYAN}╔══════════════════════════════════════════════════════════════╗
@@ -112,9 +150,9 @@ def print_banner():
 ║   to book a table. Respond however you like!                 ║
 ║                                                              ║
 ║   • 🔊 Agent speaks its responses aloud                      ║
+║   • 📱 Real SMS on confirmation!                             ║
 ║   • Ask for a callback number — the agent has one!           ║
-║   • Speak broken English • Misunderstand requests            ║
-║   • Put on hold • Be fully booked • Type 'quit' to hang up  ║
+║   • Type 'quit' to hang up                                   ║
 ╚══════════════════════════════════════════════════════════════╝{RESET}
 """)
 
@@ -178,7 +216,7 @@ def get_reservation_config() -> dict:
     }
 
 
-async def run_interactive(use_voice: bool = True):
+async def run_interactive(use_voice: bool = True, use_sms: bool = True):
     """Run the interactive chat loop."""
     print_banner()
 
@@ -199,6 +237,16 @@ async def run_interactive(use_voice: bool = True):
         print(f"\n{GREEN}   🔊 Voice enabled ({voice}){RESET}")
     else:
         print(f"\n{YELLOW}   🔇 Voice disabled (text only){RESET}")
+
+    # Set up SMS notifier
+    sms = None
+    if use_sms:
+        sms = SMSNotifier()
+        if sms.enabled:
+            print(f"{GREEN}   📱 SMS enabled → {sms.to_phone}{RESET}")
+        else:
+            print(f"{YELLOW}   📱 SMS disabled — set USER_PHONE in .env{RESET}")
+            sms = None
 
     print(f"\n{DIM}{'─' * 60}{RESET}")
     print(f"{BOLD}{GREEN}☎️  Ring ring... The agent is calling {reservation['restaurant_name']}!{RESET}")
@@ -265,19 +313,56 @@ async def run_interactive(use_voice: bool = True):
             if tts_player:
                 await tts_player.speak(speech)
 
-        # Display action if any
+        # Display action and send SMS
         if result.get("action"):
             action = result["action"]
             if action == "confirm_reservation":
                 print(f"  {CYAN}⚡ ACTION: {BOLD}CONFIRMED{RESET}")
                 print(f"  {CYAN}   The reservation has been confirmed!{RESET}\n")
+
+                # Send confirmation SMS
+                if sms:
+                    confirmed_time = result.get("params", {}).get("time", reservation["preferred_time"])
+                    sms.send(
+                        f"🎉 Reservation Confirmed!\n\n"
+                        f"📍 {reservation['restaurant_name']}\n"
+                        f"📅 {reservation['date']}\n"
+                        f"⏰ {confirmed_time}\n"
+                        f"👥 Party of {reservation['party_size']}\n\n"
+                        f"Enjoy your dinner!"
+                    )
+
             elif action == "propose_alternative":
+                proposed = result.get("params", {}).get("time", "TBD")
                 print(f"  {MAGENTA}⚡ ACTION: {BOLD}ALTERNATIVE PROPOSED{RESET}")
+                print(f"  {MAGENTA}   Proposed time: {proposed}{RESET}")
                 print(f"  {MAGENTA}   Agent will check with the guest and call back.{RESET}\n")
+
+                # Send alternative SMS
+                if sms:
+                    sms.send(
+                        f"⏰ Alternative Time Offered\n\n"
+                        f"📍 {reservation['restaurant_name']}\n"
+                        f"📅 {reservation['date']}\n"
+                        f"⏰ Original: {reservation['preferred_time']}\n"
+                        f"⏰ Proposed: {proposed}\n"
+                        f"👥 Party of {reservation['party_size']}\n\n"
+                        f"Reply YES to confirm or NO to reject."
+                    )
+
             elif action == "end_call":
                 print(f"  {YELLOW}⚡ ACTION: {BOLD}CALL ENDED{RESET}")
                 reason = result.get("action_result", "")
                 print(f"  {YELLOW}   {reason}{RESET}\n")
+
+                # Send failure SMS
+                if sms:
+                    sms.send(
+                        f"😔 Reservation Not Available\n\n"
+                        f"📍 {reservation['restaurant_name']}\n"
+                        f"📅 {reservation['date']} at {reservation['preferred_time']}\n\n"
+                        f"Reason: {reason or 'Could not complete booking'}"
+                    )
 
         if result.get("ended"):
             break
@@ -295,12 +380,15 @@ async def run_interactive(use_voice: bool = True):
         if "status" in kwargs:
             ended_status = kwargs["status"]
     print(f"   Final status: {ended_status}")
+    if sms:
+        print(f"   SMS sent to: {sms.to_phone}")
     print(f"{DIM}{'─' * 60}{RESET}\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive reservation agent chat")
     parser.add_argument("--no-voice", action="store_true", help="Disable TTS voice (text only)")
+    parser.add_argument("--no-sms", action="store_true", help="Disable SMS notifications")
     args = parser.parse_args()
 
-    asyncio.run(run_interactive(use_voice=not args.no_voice))
+    asyncio.run(run_interactive(use_voice=not args.no_voice, use_sms=not args.no_sms))
