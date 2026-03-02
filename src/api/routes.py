@@ -31,6 +31,33 @@ async def health_check():
     return HealthResponse(status="ok")
 
 
+@router.get("/readiness")
+async def readiness_check(request: Request):
+    """Readiness check — verifies Redis connectivity."""
+    from fastapi.responses import JSONResponse
+
+    session = request.app.state.providers.get("session")
+    if session is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "reason": "no session store configured"},
+        )
+
+    try:
+        # Try a simple Redis operation
+        await session.set("__readiness_check__", {"ts": "check"}, ttl=5)
+        result = await session.get("__readiness_check__")
+        if result is None:
+            raise Exception("Redis read-back failed")
+        await session.delete("__readiness_check__")
+        return {"status": "ready"}
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "reason": str(e)},
+        )
+
+
 @router.post(
     "/reservations",
     response_model=ReservationResponse,
