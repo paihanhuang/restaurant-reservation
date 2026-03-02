@@ -108,8 +108,15 @@ def main():
     print(f"   {YELLOW}⏳ Starting ngrok tunnel...{RESET}", end="", flush=True)
     from pyngrok import ngrok, conf
 
-    # Configure pyngrok
-    pyngrok_config = conf.get_default()
+    # Configure auth token from env
+    ngrok_token = os.environ.get("NGROK_AUTHTOKEN", "")
+    if ngrok_token:
+        ngrok.set_auth_token(ngrok_token)
+    else:
+        print(f"\n{RED}❌ NGROK_AUTHTOKEN not set in .env{RESET}")
+        print(f"{DIM}   1. Get a free token: https://dashboard.ngrok.com/get-started/your-authtoken{RESET}")
+        print(f"{DIM}   2. Paste it as NGROK_AUTHTOKEN=... in your .env file{RESET}")
+        return
 
     try:
         tunnel = ngrok.connect(8000, "http")
