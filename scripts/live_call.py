@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Live call — Agent calls YOUR phone via Twilio.
 
-You pick up and play the restaurant. The agent speaks via Twilio TTS
+You pick up and play the restaurant. The agent speaks via OpenAI TTS
 and listens via Twilio's built-in speech recognition. When the
 reservation is confirmed, an SMS is sent to your phone.
 
 Architecture:
   1. pyngrok opens a public tunnel to localhost:8000
   2. FastAPI serves webhook routes for the conversation loop
-  3. Twilio calls your cell with <Say> greeting + <Gather speech>
+  3. Twilio calls your cell → greeting audio via OpenAI TTS + <Gather>
   4. Each time you speak, Twilio POSTs the transcript to our webhook
-  5. ConversationEngine processes it → returns new <Say> + <Gather>
+  5. ConversationEngine processes it → OpenAI TTS → <Play> + <Gather>
   6. On confirmation → sends SMS via Twilio
 
 Usage:
@@ -25,6 +25,7 @@ import sys
 import signal
 import time
 import threading
+import uuid
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,7 +47,7 @@ def main():
 ║   The agent will call your cell phone via Twilio.            ║
 ║   Pick up and pretend to be the restaurant staff!            ║
 ║                                                              ║
-║   • Agent speaks via Twilio TTS                              ║
+║   • Agent speaks via OpenAI TTS (natural voice)              ║
 ║   • Your speech is transcribed by Twilio STT                 ║
 ║   • GPT-4o powers the conversation                           ║
 ║   • SMS sent on confirmation                                 ║
@@ -126,8 +127,48 @@ def main():
     from src.conversation.state_machine import StateMachine
     from src.models.enums import ReservationStatus
     from src.telephony.voicemail import is_machine, build_voicemail_twiml, VOICEMAIL_TEMPLATE
+    from openai import OpenAI as OpenAISync
 
     app = FastAPI(title="Live Call Server")
+
+    # Audio store: {audio_id: mp3_bytes}
+    audio_store: dict[str, bytes] = {}
+
+    # OpenAI TTS client (sync — used in async handlers via run_in_executor)
+    openai_client = OpenAISync(api_key=required["OPENAI_API_KEY"])
+    TTS_VOICE = "nova"  # Options: alloy, echo, fable, onyx, nova, shimmer
+
+    def generate_tts_audio(text: str) -> str:
+        """Generate mp3 audio from text via OpenAI TTS. Returns audio_id."""
+        audio_id = str(uuid.uuid4())
+        try:
+            resp = openai_client.audio.speech.create(
+                model="tts-1",
+                voice=TTS_VOICE,
+                input=text,
+                response_format="mp3",
+            )
+            audio_store[audio_id] = resp.content
+            print(f"  {DIM}   [TTS] Generated {len(resp.content)} bytes → /audio/{audio_id[:8]}...{RESET}")
+        except Exception as e:
+            print(f"  {RED}   [TTS] Failed: {e}{RESET}")
+            return None
+        return audio_id
+
+    def tts_play_url(text: str) -> str | None:
+        """Generate TTS and return the Play URL, or None on failure."""
+        audio_id = generate_tts_audio(text)
+        if audio_id:
+            return f"{public_url}/audio/{audio_id}"
+        return None
+
+    @app.get("/audio/{audio_id}")
+    async def serve_audio(audio_id: str):
+        """Serve generated TTS audio to Twilio."""
+        data = audio_store.pop(audio_id, None)
+        if not data:
+            return Response(status_code=404)
+        return Response(content=data, media_type="audio/mpeg")
 
     # Shared state
     engine_holder = {
@@ -173,9 +214,15 @@ def main():
             speech_timeout="auto",
             language="en-US",
         )
-        gather.say(greeting, voice="Google.en-US-Neural2-F")
+
+        # Use OpenAI TTS
+        audio_url = tts_play_url(greeting)
+        if audio_url:
+            gather.play(audio_url)
+        else:
+            gather.say(greeting, voice="Google.en-US-Neural2-F")  # fallback
+
         response.append(gather)
-        # If no speech detected, prompt again
         response.say("I didn't catch that. Let me try again.", voice="Google.en-US-Neural2-F")
         response.redirect(f"{public_url}/voice/answer")
 
@@ -257,12 +304,17 @@ def main():
         # Build TwiML response
         response = VoiceResponse()
         if speech:
+            audio_url = tts_play_url(speech)
+
             if result.get("ended"):
                 # Final message, then hang up
-                response.say(speech, voice="Google.en-US-Neural2-F")
+                if audio_url:
+                    response.play(audio_url)
+                else:
+                    response.say(speech, voice="Google.en-US-Neural2-F")
                 response.hangup()
             else:
-                # Say response and gather next input
+                # Play response and gather next input
                 gather = Gather(
                     input="speech",
                     action=f"{public_url}/voice/respond",
@@ -270,7 +322,10 @@ def main():
                     speech_timeout="auto",
                     language="en-US",
                 )
-                gather.say(speech, voice="Google.en-US-Neural2-F")
+                if audio_url:
+                    gather.play(audio_url)
+                else:
+                    gather.say(speech, voice="Google.en-US-Neural2-F")
                 response.append(gather)
                 # Fallback
                 response.say("Are you still there?", voice="Google.en-US-Neural2-F")
