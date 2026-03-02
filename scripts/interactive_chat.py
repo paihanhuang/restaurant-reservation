@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Interactive chat — YOU play the restaurant, the AI agent calls you.
 
+Features:
+  🔊 Agent speaks its responses aloud via OpenAI TTS
+  📞 Agent can provide a callback phone number when asked
+  🧠 Real GPT-4o powers the conversation
+
 Usage:
     .venv/bin/python scripts/interactive_chat.py
-
-You'll be prompted to type restaurant responses. The agent uses your real
-OpenAI API key (from .env) to generate intelligent replies, handle
-misunderstandings, and decide when to confirm/propose/end the call.
+    .venv/bin/python scripts/interactive_chat.py --no-voice   # text only
 
 Type 'quit' or 'exit' at any prompt to hang up.
 """
@@ -16,6 +18,11 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import subprocess
+import tempfile
+import struct
+import wave
+import argparse
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,6 +33,7 @@ load_dotenv()
 
 from datetime import date, time, timedelta
 from unittest.mock import AsyncMock
+from openai import AsyncOpenAI
 
 from src.providers.openai_llm import OpenAILLM
 from src.conversation.engine import ConversationEngine
@@ -45,6 +53,56 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 
 
+class TTSPlayer:
+    """Plays text as speech using OpenAI TTS + aplay."""
+
+    def __init__(self, api_key: str, voice: str = "alloy"):
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.voice = voice
+
+    async def speak(self, text: str) -> None:
+        """Synthesize text to speech and play it through speakers."""
+        if not text:
+            return
+
+        try:
+            # Get audio from OpenAI TTS (PCM format: 24kHz 16-bit mono)
+            response = await self.client.audio.speech.create(
+                model="tts-1",
+                voice=self.voice,
+                input=text,
+                response_format="pcm",
+            )
+
+            # Read all PCM bytes
+            pcm_data = response.read()
+
+            # Write to temp WAV file for aplay
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp_path = f.name
+                with wave.open(f, 'wb') as wav:
+                    wav.setnchannels(1)        # mono
+                    wav.setsampwidth(2)         # 16-bit
+                    wav.setframerate(24000)     # 24kHz
+                    wav.writeframes(pcm_data)
+
+            # Play via aplay (blocking)
+            subprocess.run(
+                ["aplay", "-q", tmp_path],
+                capture_output=True,
+                timeout=30,
+            )
+
+        except Exception as e:
+            print(f"  {DIM}   🔇 Audio playback error: {e}{RESET}")
+        finally:
+            # Cleanup temp file
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
 def print_banner():
     print(f"""
 {BOLD}{CYAN}╔══════════════════════════════════════════════════════════════╗
@@ -53,9 +111,10 @@ def print_banner():
 ║   You are the restaurant staff. The AI agent is calling you  ║
 ║   to book a table. Respond however you like!                 ║
 ║                                                              ║
-║   • Speak broken English         • Misunderstand requests    ║
-║   • Put the agent on hold        • Be fully booked           ║
-║   • Confirm or propose times     • Type 'quit' to hang up   ║
+║   • 🔊 Agent speaks its responses aloud                      ║
+║   • Ask for a callback number — the agent has one!           ║
+║   • Speak broken English • Misunderstand requests            ║
+║   • Put on hold • Be fully booked • Type 'quit' to hang up  ║
 ╚══════════════════════════════════════════════════════════════╝{RESET}
 """)
 
@@ -89,6 +148,20 @@ def get_reservation_config() -> dict:
         alt_start = parts[0].strip()
         alt_end = parts[1].strip()
 
+    # Callback phone from env or ask
+    twilio_phone = os.environ.get("TWILIO_PHONE_NUMBER", "")
+    default_phone = twilio_phone if twilio_phone else "+14155551234"
+    phone = input(f"   Callback phone {DIM}[{default_phone}]{RESET}: ").strip()
+    if not phone:
+        phone = default_phone
+
+    # Voice selection
+    print(f"\n{BOLD}🔊 TTS Voice{RESET}")
+    print(f"   {DIM}Available: alloy, echo, fable, onyx, nova, shimmer{RESET}")
+    voice = input(f"   Voice {DIM}[nova]{RESET}: ").strip()
+    if not voice:
+        voice = "nova"
+
     return {
         "reservation_id": "interactive-001",
         "restaurant_name": restaurant,
@@ -100,10 +173,12 @@ def get_reservation_config() -> dict:
         "special_requests": special,
         "alt_time_start": alt_start,
         "alt_time_end": alt_end,
+        "callback_phone": phone,
+        "_voice": voice,
     }
 
 
-async def run_interactive():
+async def run_interactive(use_voice: bool = True):
     """Run the interactive chat loop."""
     print_banner()
 
@@ -115,6 +190,15 @@ async def run_interactive():
 
     # Get reservation config
     reservation = get_reservation_config()
+    voice = reservation.pop("_voice", "nova")
+
+    # Set up TTS player
+    tts_player = None
+    if use_voice:
+        tts_player = TTSPlayer(api_key=api_key, voice=voice)
+        print(f"\n{GREEN}   🔊 Voice enabled ({voice}){RESET}")
+    else:
+        print(f"\n{YELLOW}   🔇 Voice disabled (text only){RESET}")
 
     print(f"\n{DIM}{'─' * 60}{RESET}")
     print(f"{BOLD}{GREEN}☎️  Ring ring... The agent is calling {reservation['restaurant_name']}!{RESET}")
@@ -140,6 +224,10 @@ async def run_interactive():
     # Generate and display greeting
     greeting = await engine.generate_greeting()
     print(f"  {BLUE}{BOLD}🤖 Agent:{RESET} {greeting}\n")
+
+    # Speak the greeting
+    if tts_player:
+        await tts_player.speak(greeting)
 
     # Chat loop
     turn = 0
@@ -169,8 +257,13 @@ async def run_interactive():
             continue
 
         # Display agent response
-        if result.get("speech_text"):
-            print(f"  {BLUE}{BOLD}🤖 Agent:{RESET} {result['speech_text']}\n")
+        speech = result.get("speech_text")
+        if speech:
+            print(f"  {BLUE}{BOLD}🤖 Agent:{RESET} {speech}\n")
+
+            # Speak it!
+            if tts_player:
+                await tts_player.speak(speech)
 
         # Display action if any
         if result.get("action"):
@@ -206,4 +299,8 @@ async def run_interactive():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_interactive())
+    parser = argparse.ArgumentParser(description="Interactive reservation agent chat")
+    parser.add_argument("--no-voice", action="store_true", help="Disable TTS voice (text only)")
+    args = parser.parse_args()
+
+    asyncio.run(run_interactive(use_voice=not args.no_voice))

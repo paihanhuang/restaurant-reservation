@@ -67,6 +67,7 @@ class ConversationEngine:
             special_requests=reservation.get("special_requests"),
             alt_time_start=alt_start,
             alt_time_end=alt_end,
+            callback_phone=reservation.get("callback_phone"),
         )
 
         # Conversation messages (OpenAI format)

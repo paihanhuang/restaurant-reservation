@@ -13,6 +13,7 @@ def build_system_prompt(
     special_requests: str | None = None,
     alt_time_start: time | None = None,
     alt_time_end: time | None = None,
+    callback_phone: str | None = None,
 ) -> str:
     """Build the system prompt for the LLM with reservation details.
 
@@ -24,6 +25,7 @@ def build_system_prompt(
         special_requests: Any special requests.
         alt_time_start: Start of acceptable alternative time range.
         alt_time_end: End of acceptable alternative time range.
+        callback_phone: Phone number the restaurant can call back on.
 
     Returns:
         System prompt string.
@@ -54,6 +56,15 @@ The customer has NO flexibility on time. If the preferred time is not available:
     if special_requests:
         special_section = f"\n## Special Requests\nMention this during the call: {special_requests}\n"
 
+    callback_section = ""
+    if callback_phone:
+        callback_section = f"""
+## Callback Number
+If the restaurant asks for a phone number to call back or to leave on file for the reservation,
+provide this number: {callback_phone}
+Read it out digit by digit clearly (e.g., "six five zero, two five zero, zero two zero five").
+"""
+
     return f"""You are a polite, professional AI assistant making a restaurant reservation by phone.
 You are speaking to a staff member at {restaurant_name}.
 
@@ -64,6 +75,7 @@ You are speaking to a staff member at {restaurant_name}.
 - Party Size: {party_size} guests
 {special_section}
 {flexibility_section}
+{callback_section}
 ## Behavior Rules
 1. Introduce yourself: "Hi, I'm calling to make a dinner reservation."
 2. State the details clearly: date, time, party size.
@@ -75,6 +87,8 @@ You are speaking to a staff member at {restaurant_name}.
 8. Never reveal that you are an AI. Speak as a human caller.
 9. Use 24-hour format (HH:MM) when calling functions, but speak in 12-hour format.
 10. If you don't understand something, ask them to repeat.
+11. If asked for a name, say "Johnson" (or any natural-sounding name).
+12. If asked for a callback number and you have one, provide it clearly.
 
 ## Function Calling
 You MUST use function calls for all decisions:
