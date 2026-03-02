@@ -144,11 +144,19 @@ def main():
     from src.conversation.engine import ConversationEngine
     from src.conversation.state_machine import StateMachine
     from src.models.enums import ReservationStatus
+    from src.telephony.voicemail import is_machine, build_voicemail_twiml, VOICEMAIL_TEMPLATE
 
     app = FastAPI(title="Live Call Server")
 
     # Shared state
-    engine_holder = {"engine": None, "sms_sent": False, "confirmed": False}
+    engine_holder = {
+        "engine": None,
+        "sms_sent": False,
+        "confirmed": False,
+        "voicemail_detected": False,
+        "attempt": 1,
+        "call_sid": None,
+    }
 
     @app.on_event("startup")
     async def setup_engine():
@@ -295,6 +303,33 @@ def main():
         """Twilio call status callback."""
         return {"ok": True}
 
+    @app.post("/voice/amd-status")
+    async def voice_amd_status(AnsweredBy: str = Form("unknown"), CallSid: str = Form("")):
+        """Twilio async AMD status callback."""
+        print(f"\n  {DIM}   [AMD] AnsweredBy={AnsweredBy} CallSid={CallSid}{RESET}")
+
+        if is_machine(AnsweredBy):
+            engine_holder["voicemail_detected"] = True
+            print(f"  {RED}{BOLD}📠 VOICEMAIL DETECTED!{RESET} ({AnsweredBy})")
+            print(f"  {DIM}   Leaving voicemail message and hanging up...{RESET}")
+
+            # Modify the in-progress call to play voicemail and hang up
+            try:
+                twilio_client_inner = TwilioClient(
+                    required["TWILIO_ACCOUNT_SID"],
+                    required["TWILIO_AUTH_TOKEN"],
+                )
+                vm_twiml = build_voicemail_twiml(reservation)
+                twilio_client_inner.calls(CallSid).update(twiml=vm_twiml)
+                print(f"  {GREEN}✓ Voicemail message injected{RESET}")
+                print(f"  {YELLOW}   Would retry as attempt {engine_holder['attempt'] + 1}/3{RESET}")
+            except Exception as e:
+                print(f"  {RED}❌ Failed to inject voicemail: {e}{RESET}")
+        else:
+            print(f"  {GREEN}✓ Human detected — conversation continues{RESET}")
+
+        return {"ok": True}
+
     # Start uvicorn in a thread
     import threading
 
@@ -321,9 +356,13 @@ def main():
             from_=twilio_phone,
             url=f"{public_url}/voice/answer",
             method="POST",
+            machine_detection="DetectMessageEnd",
+            async_amd_status_callback=f"{public_url}/voice/amd-status",
+            async_amd_status_callback_method="POST",
             status_callback=f"{public_url}/voice/status",
             status_callback_event=["completed"],
         )
+        engine_holder["call_sid"] = call.sid
         print(f"  {GREEN}✓ Call SID: {call.sid}{RESET}")
         print(f"  {DIM}  Waiting for you to pick up...{RESET}\n")
     except Exception as e:
@@ -351,6 +390,7 @@ def main():
             print(f"   Turns: {engine.turn_number}")
             print(f"   Ended: {engine.ended}")
             print(f"   Confirmed: {engine_holder.get('confirmed', False)}")
+            print(f"   Voicemail: {engine_holder.get('voicemail_detected', False)}")
 
             # Fallback: if confirmation happened but SMS didn't send
             if engine_holder.get("confirmed") and not engine_holder.get("sms_sent"):

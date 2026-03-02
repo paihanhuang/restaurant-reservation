@@ -113,7 +113,9 @@ async def initiate_call(
         twiml=twiml,
         timeout=RING_TIMEOUT_SECONDS,
         time_limit=CALL_TIME_LIMIT_SECONDS,
-        machine_detection="Enable",
+        machine_detection="DetectMessageEnd",
+        async_amd_status_callback=f"{protocol}://{PUBLIC_HOST}/webhooks/twilio/amd-status",
+        async_amd_status_callback_method="POST",
         status_callback=status_callback_url,
         status_callback_event=["initiated", "ringing", "answered", "completed"],
     )

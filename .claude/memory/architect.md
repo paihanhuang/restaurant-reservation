@@ -18,4 +18,8 @@ Each entry follows this structure:
 
 ## Entries
 
-_No entries yet. This file will be populated as the project progresses._
+### [2026-03-02] Voicemail / Answering Machine Detection
+- **Action:** Designed AMD handling across two paths: production (caller.py + callbacks.py) and live test (live_call.py). Chose `DetectMessageEnd` over `Enable` for higher accuracy. Centralized logic in new `voicemail.py` module.
+- **Consequence:** Pending — to be updated after Shield review
+- **Lesson:** `machine_detection="Enable"` was already set but never acted on — always follow through on feature flags with actual handling logic.
+- **Severity:** medium

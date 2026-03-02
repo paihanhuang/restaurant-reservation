@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import structlog
 from datetime import datetime
 
 from fastapi import Request, HTTPException
@@ -9,6 +10,9 @@ from twilio.request_validator import RequestValidator
 
 from configs.telephony import TWILIO_AUTH_TOKEN
 from src.providers.base import Database
+from src.telephony.voicemail import is_machine, build_voicemail_twiml
+
+logger = structlog.get_logger()
 
 
 async def validate_twilio_signature(request: Request) -> bool:
@@ -32,6 +36,64 @@ async def validate_twilio_signature(request: Request) -> bool:
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     return True
+
+
+async def handle_amd_callback(
+    request: Request,
+    db: Database,
+) -> dict:
+    """Process a Twilio Answering Machine Detection callback.
+
+    Called asynchronously when Twilio finishes AMD analysis.
+    If a machine is detected, logs the event and returns voicemail
+    TwiML. If human, returns no-op.
+
+    Returns:
+        Dict with 'machine_detected' bool and optional 'twiml'.
+    """
+    form = await request.form()
+    params = dict(form)
+
+    call_sid = params.get("CallSid", "")
+    answered_by = params.get("AnsweredBy", "unknown")
+
+    logger.info(
+        "amd_callback.received",
+        call_sid=call_sid,
+        answered_by=answered_by,
+    )
+
+    if is_machine(answered_by):
+        logger.info(
+            "amd_callback.machine_detected",
+            call_sid=call_sid,
+            answered_by=answered_by,
+        )
+
+        # Log voicemail detection
+        await db.log_call({
+            "call_sid": call_sid,
+            "status": "voicemail_detected",
+            "started_at": datetime.utcnow().isoformat(),
+            "error_message": f"Answered by: {answered_by}",
+        })
+
+        return {
+            "machine_detected": True,
+            "call_sid": call_sid,
+            "answered_by": answered_by,
+        }
+
+    logger.info(
+        "amd_callback.human_detected",
+        call_sid=call_sid,
+    )
+
+    return {
+        "machine_detected": False,
+        "call_sid": call_sid,
+        "answered_by": answered_by,
+    }
 
 
 async def handle_status_callback(
@@ -77,3 +139,4 @@ async def handle_status_callback(
     })
 
     return {"status": "received", "call_sid": call_sid}
+
