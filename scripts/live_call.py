@@ -192,10 +192,10 @@ def main():
             speech_timeout="auto",
             language="en-US",
         )
-        gather.say(greeting, voice="Polly.Joanna")
+        gather.say(greeting, voice="Google.en-US-Neural2-F")
         response.append(gather)
         # If no speech detected, prompt again
-        response.say("I didn't catch that. Let me try again.", voice="Polly.Joanna")
+        response.say("I didn't catch that. Let me try again.", voice="Google.en-US-Neural2-F")
         response.redirect(f"{public_url}/voice/answer")
 
         return Response(content=str(response), media_type="application/xml")
@@ -209,7 +209,7 @@ def main():
         if not text:
             # No speech detected — reprompt
             response = VoiceResponse()
-            response.say("I'm sorry, I didn't catch that. Could you repeat?", voice="Polly.Joanna")
+            response.say("I'm sorry, I didn't catch that. Could you repeat?", voice="Google.en-US-Neural2-F")
             gather = Gather(
                 input="speech",
                 action=f"{public_url}/voice/respond",
@@ -228,7 +228,7 @@ def main():
         except Exception as e:
             print(f"  {RED}❌ Engine error: {e}{RESET}")
             response = VoiceResponse()
-            response.say("I'm having some trouble. Could you repeat that?", voice="Polly.Joanna")
+            response.say("I'm having some trouble. Could you repeat that?", voice="Google.en-US-Neural2-F")
             gather = Gather(
                 input="speech",
                 action=f"{public_url}/voice/respond",
@@ -277,7 +277,7 @@ def main():
         if speech:
             if result.get("ended"):
                 # Final message, then hang up
-                response.say(speech, voice="Polly.Joanna")
+                response.say(speech, voice="Google.en-US-Neural2-F")
                 response.hangup()
             else:
                 # Say response and gather next input
@@ -288,10 +288,10 @@ def main():
                     speech_timeout="auto",
                     language="en-US",
                 )
-                gather.say(speech, voice="Polly.Joanna")
+                gather.say(speech, voice="Google.en-US-Neural2-F")
                 response.append(gather)
                 # Fallback
-                response.say("Are you still there?", voice="Polly.Joanna")
+                response.say("Are you still there?", voice="Google.en-US-Neural2-F")
                 response.redirect(f"{public_url}/voice/respond")
         else:
             response.hangup()

@@ -99,4 +99,4 @@ class TestBuildVoicemailTwiml:
 
     def test_voice_is_polly_joanna(self):
         twiml = build_voicemail_twiml(self.SAMPLE_RESERVATION)
-        assert "Polly.Joanna" in twiml
+        assert "Google.en-US-Neural2-F" in twiml

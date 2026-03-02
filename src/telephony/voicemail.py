@@ -63,6 +63,6 @@ def build_voicemail_twiml(reservation: dict) -> str:
 
     response = VoiceResponse()
     response.pause(length=1)  # Wait for beep to finish
-    response.say(message, voice="Polly.Joanna")
+    response.say(message, voice="Google.en-US-Neural2-F")
     response.hangup()
     return str(response)
