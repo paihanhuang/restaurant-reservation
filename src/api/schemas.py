@@ -27,7 +27,7 @@ class TimeWindow(BaseModel):
 class UserContact(BaseModel):
     """User contact information for notifications."""
     phone: str = Field(..., pattern=r"^\+[1-9]\d{1,14}$", description="E.164 phone number")
-    email: str = Field(..., pattern=r"^[^@]+@[^@]+\.[^@]+$")
+    email: str | None = Field(None, pattern=r"^[^@]+@[^@]+\.[^@]+$")
 
 
 class ReservationRequest(BaseModel):

@@ -46,7 +46,7 @@ async def create_reservation(payload: ReservationRequest, request: Request):
         date=payload.date,
         preferred_time=payload.preferred_time,
         party_size=payload.party_size,
-        user_id=payload.user_contact.email,  # Use email as user ID for now
+        user_id=payload.user_contact.email or payload.user_contact.phone,
         user_phone=payload.user_contact.phone,
         user_email=payload.user_contact.email,
         alt_time_start=payload.alt_time_window.start if payload.alt_time_window else None,
@@ -142,6 +142,88 @@ async def cancel_reservation(reservation_id: str, request: Request):
         "to_state": ReservationStatus.FAILED.value,
         "trigger": "user_cancel",
         "call_sid": data.get("call_sid"),
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+    data["status"] = ReservationStatus.FAILED.value
+    return ReservationResponse(
+        reservation_id=data["reservation_id"],
+        status=ReservationStatus.FAILED,
+        restaurant_name=data["restaurant_name"],
+        date=data["date"],
+        preferred_time=data["preferred_time"],
+        party_size=data["party_size"],
+        confirmed_time=data.get("confirmed_time"),
+        call_attempts=data.get("call_attempts", 0),
+    )
+
+
+@router.post(
+    "/reservations/{reservation_id}/confirm-alternative",
+    response_model=ReservationResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+async def confirm_alternative(reservation_id: str, request: Request):
+    """Confirm an alternative time proposed by the restaurant."""
+    db = _get_db(request)
+    data = await db.get_reservation(reservation_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    current_status = ReservationStatus(data["status"])
+    if current_status != ReservationStatus.ALTERNATIVE_PROPOSED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot confirm alternative in '{current_status}' state (must be 'alternative_proposed')",
+        )
+
+    await db.update_reservation(reservation_id, status=ReservationStatus.CONFIRMED.value)
+    await db.log_state_transition({
+        "reservation_id": reservation_id,
+        "from_state": current_status.value,
+        "to_state": ReservationStatus.CONFIRMED.value,
+        "trigger": "user_confirm_alt",
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+    data["status"] = ReservationStatus.CONFIRMED.value
+    return ReservationResponse(
+        reservation_id=data["reservation_id"],
+        status=ReservationStatus.CONFIRMED,
+        restaurant_name=data["restaurant_name"],
+        date=data["date"],
+        preferred_time=data["preferred_time"],
+        party_size=data["party_size"],
+        confirmed_time=data.get("confirmed_time"),
+        call_attempts=data.get("call_attempts", 0),
+    )
+
+
+@router.post(
+    "/reservations/{reservation_id}/reject-alternative",
+    response_model=ReservationResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+async def reject_alternative(reservation_id: str, request: Request):
+    """Reject an alternative time proposed by the restaurant."""
+    db = _get_db(request)
+    data = await db.get_reservation(reservation_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    current_status = ReservationStatus(data["status"])
+    if current_status != ReservationStatus.ALTERNATIVE_PROPOSED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reject alternative in '{current_status}' state",
+        )
+
+    await db.update_reservation(reservation_id, status=ReservationStatus.FAILED.value)
+    await db.log_state_transition({
+        "reservation_id": reservation_id,
+        "from_state": current_status.value,
+        "to_state": ReservationStatus.FAILED.value,
+        "trigger": "user_reject_alt",
         "timestamp": datetime.utcnow().isoformat(),
     })
 
