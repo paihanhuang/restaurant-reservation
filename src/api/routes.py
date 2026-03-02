@@ -16,8 +16,14 @@ from src.api.schemas import (
 from src.models.enums import ReservationStatus
 from src.models.reservation import Reservation
 from src.providers.base import Database
+from src.notifications.sms_webhook import router as sms_router
+from src.dashboard.routes import router as dashboard_router
 
 router = APIRouter()
+
+# Mount sub-routers
+router.include_router(sms_router)
+router.include_router(dashboard_router)
 
 
 def _get_db(request: Request) -> Database:

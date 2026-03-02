@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reservation Agent — Dashboard</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --surface-hover: #22263a;
+            --border: #2a2e3f;
+            --text: #e4e6eb;
+            --text-dim: #8b8fa3;
+            --accent: #6366f1;
+            --green: #22c55e;
+            --red: #ef4444;
+            --yellow: #f59e0b;
+            --blue: #3b82f6;
+            --purple: #a855f7;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.connected { background: var(--green); }
+        .status-dot.disconnected { background: var(--red); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .header-info {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 4rem 2rem;
+            color: var(--text-dim);
+        }
+
+        .empty-state h2 { font-size: 1.2rem; margin-bottom: 0.5rem; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--surface);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        thead th {
+            background: var(--surface-hover);
+            padding: 0.75rem 1rem;
+            text-align: left;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dim);
+            border-bottom: 1px solid var(--border);
+        }
+
+        tbody td {
+            padding: 0.75rem 1rem;
+            font-size: 0.9rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        tbody tr:hover { background: var(--surface-hover); }
+        tbody tr:last-child td { border-bottom: none; }
+
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-pending     { background: #f59e0b20; color: var(--yellow); }
+        .badge-calling     { background: #3b82f620; color: var(--blue); }
+        .badge-confirmed   { background: #22c55e20; color: var(--green); }
+        .badge-failed      { background: #ef444420; color: var(--red); }
+        .badge-alternative_proposed { background: #a855f720; color: var(--purple); }
+
+        .actions { display: flex; gap: 0.5rem; }
+
+        .btn {
+            padding: 0.35rem 0.75rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .btn:hover { opacity: 0.85; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-confirm { background: var(--green); color: #fff; }
+        .btn-reject { background: var(--red); color: #fff; }
+
+        .toast {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.75rem 1.25rem;
+            font-size: 0.85rem;
+            color: var(--text);
+            opacity: 0;
+            transform: translateY(10px);
+            transition: all 0.3s;
+            z-index: 100;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .refresh-btn {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+
+        .refresh-btn:hover { color: var(--text); border-color: var(--accent); }
+
+        @media (max-width: 768px) {
+            body { padding: 1rem; }
+            table { font-size: 0.8rem; }
+            thead th, tbody td { padding: 0.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>
+            Reservation Dashboard
+            <span id="sse-dot" class="status-dot disconnected" title="SSE disconnected"></span>
+        </h1>
+        <div style="display: flex; align-items: center; gap: 1rem;">
+            <span id="count" class="header-info">Loading...</span>
+            <button class="refresh-btn" onclick="loadReservations()">Refresh</button>
+        </div>
+    </header>
+
+    <div id="content"></div>
+    <div id="toast" class="toast"></div>
+
+    <script>
+        let reservations = [];
+        let eventSource = null;
+
+        // --- Data Loading ---
+        async function loadReservations() {
+            try {
+                const res = await fetch('/api/dashboard/reservations');
+                reservations = await res.json();
+                render();
+            } catch (e) {
+                console.error('Failed to load reservations:', e);
+            }
+        }
+
+        // --- Rendering ---
+        function render() {
+            const el = document.getElementById('content');
+            const countEl = document.getElementById('count');
+
+            if (reservations.length === 0) {
+                el.innerHTML = `
+                    <div class="empty-state">
+                        <h2>No reservations yet</h2>
+                        <p>Submit a reservation via the API to get started.</p>
+                    </div>`;
+                countEl.textContent = '0 reservations';
+                return;
+            }
+
+            countEl.textContent = `${reservations.length} reservation${reservations.length !== 1 ? 's' : ''}`;
+
+            el.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Restaurant</th>
+                            <th>Date</th>
+                            <th>Time</th>
+                            <th>Party</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${reservations.map(r => `
+                            <tr id="row-${r.reservation_id}">
+                                <td>${esc(r.restaurant_name)}</td>
+                                <td>${r.date}</td>
+                                <td>${r.confirmed_time || r.preferred_time}</td>
+                                <td>${r.party_size}</td>
+                                <td><span class="badge badge-${r.status}">${r.status}</span></td>
+                                <td class="actions">
+                                    ${r.status === 'alternative_proposed' ? `
+                                        <button class="btn btn-confirm" onclick="confirmAlt('${r.reservation_id}')">Accept</button>
+                                        <button class="btn btn-reject" onclick="rejectAlt('${r.reservation_id}')">Reject</button>
+                                    ` : '—'}
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function esc(str) {
+            const d = document.createElement('div');
+            d.textContent = str || '';
+            return d.innerHTML;
+        }
+
+        // --- Actions ---
+        async function confirmAlt(id) {
+            try {
+                const res = await fetch(`/reservations/${id}/confirm-alternative`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('Reservation confirmed!');
+                    await loadReservations();
+                } else {
+                    const err = await res.json();
+                    showToast('Error: ' + (err.detail || 'Unknown error'));
+                }
+            } catch (e) {
+                showToast('Network error');
+            }
+        }
+
+        async function rejectAlt(id) {
+            try {
+                const res = await fetch(`/reservations/${id}/reject-alternative`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('Offer rejected');
+                    await loadReservations();
+                } else {
+                    const err = await res.json();
+                    showToast('Error: ' + (err.detail || 'Unknown error'));
+                }
+            } catch (e) {
+                showToast('Network error');
+            }
+        }
+
+        // --- SSE ---
+        function connectSSE() {
+            // Use a generic user_id; in production this would be the logged-in user
+            const userId = 'dashboard';
+            eventSource = new EventSource(`/events/${userId}`);
+
+            eventSource.onopen = () => {
+                document.getElementById('sse-dot').className = 'status-dot connected';
+                document.getElementById('sse-dot').title = 'SSE connected';
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    showToast(`Status update: ${data.restaurant_name || ''} → ${data.status || data.type}`);
+                    loadReservations(); // Full refresh on any event
+                } catch (e) {
+                    console.warn('SSE parse error:', e);
+                }
+            };
+
+            eventSource.onerror = () => {
+                document.getElementById('sse-dot').className = 'status-dot disconnected';
+                document.getElementById('sse-dot').title = 'SSE disconnected — reconnecting...';
+            };
+        }
+
+        // --- Toast ---
+        function showToast(msg) {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+
+        // --- Init ---
+        loadReservations();
+        connectSSE();
+    </script>
+</body>
+</html>

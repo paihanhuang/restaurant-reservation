@@ -134,3 +134,8 @@ class Database(ABC):
     async def get_transcript(self, reservation_id: str) -> list[dict]:
         """Retrieve all transcript turns for a reservation, ordered by turn number."""
         ...
+
+    @abstractmethod
+    async def list_all_reservations(self) -> list[dict]:
+        """List all reservations, ordered by most recent first."""
+        ...

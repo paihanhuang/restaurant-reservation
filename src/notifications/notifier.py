@@ -52,7 +52,7 @@ TEMPLATES = {
             "⏰ Original time: {preferred_time}\n"
             "⏰ Proposed time: {proposed_time}\n"
             "👥 Party size: {party_size}\n\n"
-            "Reply to confirm or reject this alternative."
+            "Reply YES to confirm or NO to reject this alternative."
         ),
     },
     NotificationType.TIMEOUT: {
@@ -68,16 +68,17 @@ TEMPLATES = {
 
 
 class Notifier:
-    """Dispatches notifications via SMS and email."""
+    """Dispatches notifications via SMS, email, and SSE."""
 
-    def __init__(self, sms_sender=None, email_sender=None):
-        """Initialize with optional SMS and email sender implementations.
+    def __init__(self, sms_sender=None, email_sender=None, sse_manager=None):
+        """Initialize with optional SMS, email, and SSE sender implementations.
 
         In production, sms_sender would use Twilio, email_sender would use SMTP.
-        Both are injectable for testing.
+        All are injectable for testing.
         """
         self.sms_sender = sms_sender
         self.email_sender = email_sender
+        self.sse_manager = sse_manager
 
     async def notify(
         self,
@@ -93,12 +94,12 @@ class Notifier:
             extra: Additional context (reason, proposed_time, etc.).
 
         Returns:
-            Dict with sms_sent and email_sent status.
+            Dict with sms_sent, email_sent, and sse_sent status.
         """
         template = TEMPLATES.get(notification_type)
         if not template:
             logger.warning("notifier.unknown_type", type=notification_type)
-            return {"sms_sent": False, "email_sent": False}
+            return {"sms_sent": False, "email_sent": False, "sse_sent": False}
 
         # Merge reservation data with extra context for formatting
         context = {**reservation}
@@ -108,7 +109,7 @@ class Notifier:
         subject = template["subject"].format(**{k: context.get(k, "") for k in _extract_keys(template["subject"])})
         body = template["body"].format(**{k: context.get(k, "") for k in _extract_keys(template["body"])})
 
-        result = {"sms_sent": False, "email_sent": False}
+        result = {"sms_sent": False, "email_sent": False, "sse_sent": False}
 
         # Send SMS if phone available
         user_phone = reservation.get("user_phone")
@@ -129,6 +130,36 @@ class Notifier:
                 logger.info("notifier.email_sent", email=user_email, type=notification_type)
             except Exception as e:
                 logger.error("notifier.email_error", error=str(e))
+
+        # Publish SSE event
+        if self.sse_manager:
+            user_id = reservation.get("user_id", user_phone or "")
+            if user_id:
+                try:
+                    await self.sse_manager.publish(
+                        user_id=user_id,
+                        event_type=notification_type.value,
+                        data={
+                            "reservation_id": reservation.get("reservation_id", ""),
+                            "restaurant_name": reservation.get("restaurant_name", ""),
+                            "status": notification_type.value,
+                            "message": body,
+                        },
+                    )
+                    # Also publish to 'dashboard' channel for the web dashboard
+                    await self.sse_manager.publish(
+                        user_id="dashboard",
+                        event_type=notification_type.value,
+                        data={
+                            "reservation_id": reservation.get("reservation_id", ""),
+                            "restaurant_name": reservation.get("restaurant_name", ""),
+                            "status": notification_type.value,
+                        },
+                    )
+                    result["sse_sent"] = True
+                    logger.info("notifier.sse_sent", user_id=user_id, type=notification_type)
+                except Exception as e:
+                    logger.error("notifier.sse_error", error=str(e))
 
         return result
 

@@ -153,3 +153,13 @@ class SQLiteDatabase(Database):
             return [dict(r) for r in rows]
         finally:
             conn.close()
+
+    async def list_all_reservations(self) -> list[dict]:
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM reservations ORDER BY created_at DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
