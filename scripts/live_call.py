@@ -32,16 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── ANSI colors ──────────────────────────────────────────────────────────
-BLUE = "\033[94m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-CYAN = "\033[96m"
-MAGENTA = "\033[95m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RESET = "\033[0m"
+from scripts.shared.colors import BLUE, GREEN, YELLOW, RED, CYAN, MAGENTA, BOLD, DIM, RESET
+from scripts.shared.sms import send_sms, format_confirmation_sms, format_alternative_sms
+from scripts.shared.config import prompt_reservation
 
 
 def main():
@@ -83,24 +76,12 @@ def main():
     print(f"   Calling to:  {user_phone}")
 
     # Get reservation details
-    from datetime import date, timedelta
-    restaurant = input(f"\n   Restaurant name {DIM}[Bella Italia]{RESET}: ").strip() or "Bella Italia"
-    date_str = input(f"   Date {DIM}[{(date.today() + timedelta(days=7)).isoformat()}]{RESET}: ").strip()
-    if not date_str:
-        date_str = (date.today() + timedelta(days=7)).isoformat()
-    time_str = input(f"   Time {DIM}[19:30]{RESET}: ").strip() or "19:30"
-    party_str = input(f"   Party size {DIM}[4]{RESET}: ").strip() or "4"
-
-    reservation = {
-        "reservation_id": "live-call-001",
-        "restaurant_name": restaurant,
-        "date": date_str,
-        "preferred_time": time_str,
-        "party_size": int(party_str),
-        "callback_phone": twilio_phone,
-        "user_phone": user_phone,
-        "status": "calling",
-    }
+    reservation = prompt_reservation(
+        reservation_id="live-call-001",
+        include_extras=False,
+    )
+    reservation["callback_phone"] = twilio_phone
+    reservation["user_phone"] = user_phone
 
     print(f"\n{DIM}{'─' * 60}{RESET}")
     print(f"{BOLD}🚀 Starting infrastructure...{RESET}\n")
@@ -255,16 +236,17 @@ def main():
                 print(f"\n  {CYAN}⚡ ACTION: {BOLD}CONFIRMED!{RESET}")
                 engine_holder["confirmed"] = True
                 threading.Thread(
-                    target=_send_confirmation_sms,
-                    args=(reservation, required),
+                    target=send_sms,
+                    args=(format_confirmation_sms(reservation), required),
                     daemon=True,
                 ).start()
             elif action == "propose_alternative":
                 print(f"\n  {MAGENTA}⚡ ACTION: {BOLD}ALTERNATIVE PROPOSED{RESET}")
                 params = result.get("params", {})
+                proposed_time = params.get("proposed_time", "TBD")
                 threading.Thread(
-                    target=_send_alternative_sms,
-                    args=(reservation, params, required),
+                    target=send_sms,
+                    args=(format_alternative_sms(reservation, proposed_time), required),
                     daemon=True,
                 ).start()
             elif action == "end_call":
@@ -395,56 +377,9 @@ def main():
             # Fallback: if confirmation happened but SMS didn't send
             if engine_holder.get("confirmed") and not engine_holder.get("sms_sent"):
                 print(f"\n  {YELLOW}📱 Sending fallback SMS...{RESET}")
-                _send_confirmation_sms(reservation, required)
+                send_sms(format_confirmation_sms(reservation), required)
 
         print(f"{DIM}{'─' * 60}{RESET}\n")
-
-
-def _send_confirmation_sms(reservation: dict, env: dict):
-    """Send confirmation SMS via Twilio (called from background thread)."""
-    print(f"  {DIM}   [SMS] Attempting to send confirmation SMS...{RESET}")
-    try:
-        from twilio.rest import Client
-        client = Client(env["TWILIO_ACCOUNT_SID"], env["TWILIO_AUTH_TOKEN"])
-        msg = client.messages.create(
-            body=(
-                f"🎉 Reservation Confirmed!\n\n"
-                f"📍 {reservation['restaurant_name']}\n"
-                f"📅 {reservation['date']}\n"
-                f"⏰ {reservation['preferred_time']}\n"
-                f"👥 Party of {reservation['party_size']}\n\n"
-                f"Enjoy your dinner!"
-            ),
-            from_=env["TWILIO_PHONE_NUMBER"],
-            to=env["USER_PHONE"],
-        )
-        print(f"  {GREEN}📱 SMS confirmation sent! SID: {msg.sid}{RESET}")
-    except Exception as e:
-        print(f"  {RED}📱 SMS FAILED: {type(e).__name__}: {e}{RESET}")
-
-
-def _send_alternative_sms(reservation: dict, params: dict, env: dict):
-    """Send alternative proposal SMS via Twilio."""
-    try:
-        from twilio.rest import Client
-        proposed_time = params.get("proposed_time", "TBD")
-        client = Client(env["TWILIO_ACCOUNT_SID"], env["TWILIO_AUTH_TOKEN"])
-        client.messages.create(
-            body=(
-                f"⏰ Alternative Time Proposed\n\n"
-                f"📍 {reservation['restaurant_name']}\n"
-                f"📅 {reservation['date']}\n"
-                f"⏰ Original: {reservation['preferred_time']}\n"
-                f"⏰ Proposed: {proposed_time}\n"
-                f"👥 Party of {reservation['party_size']}\n\n"
-                f"Reply YES to confirm or NO to reject."
-            ),
-            from_=env["TWILIO_PHONE_NUMBER"],
-            to=env["USER_PHONE"],
-        )
-        print(f"  {MAGENTA}📱 SMS alternative sent to {env['USER_PHONE']}{RESET}")
-    except Exception as e:
-        print(f"  {RED}📱 SMS failed: {e}{RESET}")
 
 
 if __name__ == "__main__":

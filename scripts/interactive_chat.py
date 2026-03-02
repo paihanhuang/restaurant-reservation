@@ -42,17 +42,9 @@ from src.conversation.engine import ConversationEngine
 from src.conversation.state_machine import StateMachine
 from src.models.enums import ReservationStatus
 
-
-# ── ANSI colors ──────────────────────────────────────────────────────────
-BLUE = "\033[94m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-CYAN = "\033[96m"
-MAGENTA = "\033[95m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RESET = "\033[0m"
+from scripts.shared.colors import BLUE, GREEN, YELLOW, RED, CYAN, MAGENTA, BOLD, DIM, RESET
+from scripts.shared.sms import send_sms, format_confirmation_sms, format_alternative_sms
+from scripts.shared.config import prompt_reservation
 
 
 class TTSPlayer:
@@ -105,42 +97,6 @@ class TTSPlayer:
                 pass
 
 
-class SMSNotifier:
-    """Sends real SMS via Twilio."""
-
-    def __init__(self):
-        self.account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-        self.auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-        self.from_phone = os.environ.get("TWILIO_PHONE_NUMBER")
-        self.to_phone = os.environ.get("USER_PHONE")
-        self.enabled = all([
-            self.account_sid,
-            self.auth_token,
-            self.from_phone,
-            self.to_phone,
-            self.to_phone != "+1XXXXXXXXXX",  # Not placeholder
-        ])
-
-    def send(self, body: str) -> bool:
-        """Send an SMS. Returns True if successful."""
-        if not self.enabled:
-            return False
-
-        try:
-            from twilio.rest import Client
-            client = Client(self.account_sid, self.auth_token)
-            message = client.messages.create(
-                body=body,
-                from_=self.from_phone,
-                to=self.to_phone,
-            )
-            print(f"  {GREEN}📱 SMS sent to {self.to_phone} (SID: {message.sid}){RESET}")
-            return True
-        except Exception as e:
-            print(f"  {RED}📱 SMS failed: {e}{RESET}")
-            return False
-
-
 def print_banner():
     print(f"""
 {BOLD}{CYAN}╔══════════════════════════════════════════════════════════════╗
@@ -159,61 +115,10 @@ def print_banner():
 
 def get_reservation_config() -> dict:
     """Prompt user for reservation details or use defaults."""
-    print(f"{BOLD}📋 Reservation Details{RESET}")
-    print(f"{DIM}   (Press Enter to use defaults){RESET}\n")
-
-    restaurant = input(f"   Restaurant name {DIM}[Bella Italia]{RESET}: ").strip()
-    if not restaurant:
-        restaurant = "Bella Italia"
-
-    date_str = input(f"   Date {DIM}[{(date.today() + timedelta(days=7)).isoformat()}]{RESET}: ").strip()
-    if not date_str:
-        date_str = (date.today() + timedelta(days=7)).isoformat()
-
-    time_str = input(f"   Preferred time {DIM}[19:30]{RESET}: ").strip()
-    if not time_str:
-        time_str = "19:30"
-
-    party_str = input(f"   Party size {DIM}[4]{RESET}: ").strip()
-    party_size = int(party_str) if party_str else 4
-
-    special = input(f"   Special requests {DIM}[none]{RESET}: ").strip() or None
-
-    flex = input(f"   Flexible time window? {DIM}(e.g. 18:00-21:00 or Enter for none){RESET}: ").strip()
-    alt_start = alt_end = None
-    if flex and "-" in flex:
-        parts = flex.split("-")
-        alt_start = parts[0].strip()
-        alt_end = parts[1].strip()
-
-    # Callback phone from env or ask
-    twilio_phone = os.environ.get("TWILIO_PHONE_NUMBER", "")
-    default_phone = twilio_phone if twilio_phone else "+14155551234"
-    phone = input(f"   Callback phone {DIM}[{default_phone}]{RESET}: ").strip()
-    if not phone:
-        phone = default_phone
-
-    # Voice selection
-    print(f"\n{BOLD}🔊 TTS Voice{RESET}")
-    print(f"   {DIM}Available: alloy, echo, fable, onyx, nova, shimmer{RESET}")
-    voice = input(f"   Voice {DIM}[nova]{RESET}: ").strip()
-    if not voice:
-        voice = "nova"
-
-    return {
-        "reservation_id": "interactive-001",
-        "restaurant_name": restaurant,
-        "restaurant_phone": "+14155551234",
-        "date": date_str,
-        "preferred_time": time_str,
-        "party_size": party_size,
-        "status": ReservationStatus.CALLING,
-        "special_requests": special,
-        "alt_time_start": alt_start,
-        "alt_time_end": alt_end,
-        "callback_phone": phone,
-        "_voice": voice,
-    }
+    return prompt_reservation(
+        reservation_id="interactive-001",
+        include_extras=True,
+    )
 
 
 async def run_interactive(use_voice: bool = True, use_sms: bool = True):
@@ -238,15 +143,13 @@ async def run_interactive(use_voice: bool = True, use_sms: bool = True):
     else:
         print(f"\n{YELLOW}   🔇 Voice disabled (text only){RESET}")
 
-    # Set up SMS notifier
-    sms = None
-    if use_sms:
-        sms = SMSNotifier()
-        if sms.enabled:
-            print(f"{GREEN}   📱 SMS enabled → {sms.to_phone}{RESET}")
-        else:
-            print(f"{YELLOW}   📱 SMS disabled — set USER_PHONE in .env{RESET}")
-            sms = None
+    # Set up SMS
+    sms_enabled = use_sms and os.environ.get("USER_PHONE", "") not in ("", "+1XXXXXXXXXX")
+    if sms_enabled:
+        print(f"{GREEN}   📱 SMS enabled → {os.environ.get('USER_PHONE')}{RESET}")
+    elif use_sms:
+        print(f"{YELLOW}   📱 SMS disabled — set USER_PHONE in .env{RESET}")
+        sms_enabled = False
 
     print(f"\n{DIM}{'─' * 60}{RESET}")
     print(f"{BOLD}{GREEN}☎️  Ring ring... The agent is calling {reservation['restaurant_name']}!{RESET}")
@@ -319,45 +222,23 @@ async def run_interactive(use_voice: bool = True, use_sms: bool = True):
             if action == "confirm_reservation":
                 print(f"  {CYAN}⚡ ACTION: {BOLD}CONFIRMED{RESET}")
                 print(f"  {CYAN}   The reservation has been confirmed!{RESET}\n")
-
-                # Send confirmation SMS
-                if sms:
-                    confirmed_time = result.get("params", {}).get("time", reservation["preferred_time"])
-                    sms.send(
-                        f"🎉 Reservation Confirmed!\n\n"
-                        f"📍 {reservation['restaurant_name']}\n"
-                        f"📅 {reservation['date']}\n"
-                        f"⏰ {confirmed_time}\n"
-                        f"👥 Party of {reservation['party_size']}\n\n"
-                        f"Enjoy your dinner!"
-                    )
+                if sms_enabled:
+                    send_sms(format_confirmation_sms(reservation))
 
             elif action == "propose_alternative":
                 proposed = result.get("params", {}).get("time", "TBD")
                 print(f"  {MAGENTA}⚡ ACTION: {BOLD}ALTERNATIVE PROPOSED{RESET}")
                 print(f"  {MAGENTA}   Proposed time: {proposed}{RESET}")
                 print(f"  {MAGENTA}   Agent will check with the guest and call back.{RESET}\n")
-
-                # Send alternative SMS
-                if sms:
-                    sms.send(
-                        f"⏰ Alternative Time Offered\n\n"
-                        f"📍 {reservation['restaurant_name']}\n"
-                        f"📅 {reservation['date']}\n"
-                        f"⏰ Original: {reservation['preferred_time']}\n"
-                        f"⏰ Proposed: {proposed}\n"
-                        f"👥 Party of {reservation['party_size']}\n\n"
-                        f"Reply YES to confirm or NO to reject."
-                    )
+                if sms_enabled:
+                    send_sms(format_alternative_sms(reservation, proposed))
 
             elif action == "end_call":
                 print(f"  {YELLOW}⚡ ACTION: {BOLD}CALL ENDED{RESET}")
                 reason = result.get("action_result", "")
                 print(f"  {YELLOW}   {reason}{RESET}\n")
-
-                # Send failure SMS
-                if sms:
-                    sms.send(
+                if sms_enabled:
+                    send_sms(
                         f"😔 Reservation Not Available\n\n"
                         f"📍 {reservation['restaurant_name']}\n"
                         f"📅 {reservation['date']} at {reservation['preferred_time']}\n\n"
@@ -380,8 +261,8 @@ async def run_interactive(use_voice: bool = True, use_sms: bool = True):
         if "status" in kwargs:
             ended_status = kwargs["status"]
     print(f"   Final status: {ended_status}")
-    if sms:
-        print(f"   SMS sent to: {sms.to_phone}")
+    if sms_enabled:
+        print(f"   SMS sent to: {os.environ.get('USER_PHONE')}")
     print(f"{DIM}{'─' * 60}{RESET}\n")
 
 
